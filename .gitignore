@@ -1,0 +1,8 @@
+jobs/*/book.pdf
+jobs/*/terjemahan.epub
+jobs/*/cache.sqlite
+jobs/*/*.png
+jobs/*/*.html
+jobs/*/images/
+jobs/*/full_book_build/
+jobs/c3caffb838924dcfb3c472ef32dc3e50/

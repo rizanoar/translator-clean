@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#1e3a5f">
+  <title>Bebaa Book Translator – Progress</title>
+  <style>
+    :root {
+      --bg:#0f172a; --card:#1e293b; --border:#334155;
+      --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80;
+      --err:#f87171; --amber:#fbbf24;
+    }
+    *{box-sizing:border-box;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:1rem;padding-bottom:4.5rem;}
+    .wrap{max-width:640px;margin:0 auto;}
+    a{color:var(--accent);text-decoration:none;}
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;}
+    .topbar h1{font-size:1.1rem;margin:0;}
+    .topbar a{font-size:.85rem;}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:.75rem;}
+
+    /* progress bar */
+    .pbar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;}
+    .pfill{height:100%;background:var(--accent);border-radius:4px;transition:width .5s;}
+    .pfill.done{background:var(--green);}
+    .pfill.err{background:var(--err);}
+    .pct{font-size:1.5rem;font-weight:800;letter-spacing:-1px;}
+    .pct .of{font-size:1rem;color:var(--muted);font-weight:400;}
+    .meta{color:var(--muted);font-size:.85rem;margin-top:.5rem;word-break:break-all;}
+    .status{padding:.15rem .5rem;border-radius:6px;font-size:.75rem;font-weight:600;display:inline-block;}
+    .s-running{background:rgba(56,189,248,.2);color:var(--accent);}
+    .s-done{background:rgba(74,222,128,.2);color:var(--green);}
+    .s-error{background:rgba(248,113,113,.2);color:var(--err);}
+    .s-cancelled{background:rgba(251,191,36,.2);color:var(--amber);}
+
+    .btn{display:inline-block;padding:.6rem 1.2rem;border-radius:10px;border:none;font-weight:700;font-size:.9rem;cursor:pointer;text-decoration:none;text-align:center;-webkit-tap-highlight-color:transparent;}
+    .btn-dl{background:var(--green);color:#06201f;width:100%;margin-top:.5rem;}
+    .btn-cancel{background:var(--err);color:#fff;}
+    .btn-retry{background:var(--amber);color:#1a1a1a;width:100%;}
+    .btn:active{transform:scale(.98);}
+
+    /* preview */
+    .preview{margin-bottom:.75rem;border-left:3px solid var(--accent);padding-left:.7rem;}
+    .preview .ph{font-size:.75rem;color:var(--muted);margin-bottom:.25rem;}
+    .preview .pt{font-size:.9rem;line-height:1.45;max-height:130px;overflow:hidden;}
+
+    /* log */
+    .log{font-family:monospace;font-size:.75rem;color:var(--muted);max-height:180px;overflow-y:auto;background:var(--bg);border-radius:6px;padding:.6rem;line-height:1.5;}
+    .log .err-line{color:var(--err);}
+    .toggle{cursor:pointer;color:var(--muted);font-size:.8rem;user-select:none;}
+    .toggle:hover{color:var(--accent);}
+    .hidden{display:none;}
+    .errbox{background:rgba(248,113,113,.08);border:1px solid var(--err);border-radius:8px;padding:.7rem;font-size:.85rem;color:var(--err);white-space:pre-wrap;word-break:break-word;}
+
+    .bottom{position:fixed;bottom:0;left:0;right:0;background:rgba(15,23,42,.92);backdrop-filter:blur(8px);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:.5rem 0 calc(.5rem + env(safe-area-inset-bottom));}
+    .bottom a{color:var(--muted);text-decoration:none;font-size:.7rem;padding:.4rem 1rem;text-align:center;}
+    .bottom a.active,.bottom a:hover{color:var(--accent);}
+    .bottom .ic{display:block;font-size:1.2rem;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <h1>📖 Terjemahan</h1>
+      <a href="/">← Upload baru</a>
+    </div>
+
+    <div class="card" id="main">
+      <div style="display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap">
+        <span class="pct"><span id="pct">0</span>%</span>
+        <span class="of" id="pages">0 / 0 halaman</span>
+        <span class="status s-running" id="badge">running</span>
+      </div>
+      <div style="margin:.6rem 0">
+        <div class="pbar"><div class="pfill" id="bar" style="width:0%"></div></div>
+      </div>
+      <div class="meta" id="meta">…</div>
+      <div id="actions" class="hidden" style="margin-top:.75rem">
+        <a class="btn btn-dl" id="dl" href="#">⬇️ Unduh EPUB</a>
+      </div>
+      <div id="retry-wrap" class="hidden" style="margin-top:.75rem">
+        <button class="btn btn-retry" onclick="retryJob()">🔄 Coba lagi halaman gagal</button>
+      </div>
+      <div id="missing-box" class="hidden" style="margin-top:.6rem;color:var(--err);font-size:.8rem"></div>
+      <div id="cancel-wrap" class="hidden" style="margin-top:.75rem">
+        <button class="btn btn-cancel" onclick="cancelJob()">⏹ Hentikan</button>
+      </div>
+    </div>
+
+    <!-- error -->
+    <div class="card hidden" id="errcard">
+      <div class="errbox" id="errbox"></div>
+    </div>
+
+    <!-- preview -->
+    <div class="card" id="prevcard">
+      <div class="toggle" onclick="document.getElementById('prevlist').classList.toggle('hidden')">
+        📄 Preview terjemahan <span id="prevtoggle">(tampilkan)</span>
+      </div>
+      <div id="prevlist" class="hidden" style="margin-top:.6rem"></div>
+    </div>
+
+    <!-- log -->
+    <div class="card">
+      <div class="toggle" onclick="const el=document.getElementById('logbox');el.classList.toggle('hidden')">
+        📋 Log aktivitas <span id="logtoggle">(tampilkan)</span>
+      </div>
+      <div id="logbox" class="log hidden" style="margin-top:.6rem"></div>
+    </div>
+  </div>
+
+  <div class="bottom">
+    <a href="/"><span class="ic">📤</span>Upload</a>
+    <a href="/jobs"><span class="ic">🗂️</span>Pekerjaan</a>
+  </div>
+
+  <script>
+    const JOB = '{{ job_id }}';
+    const bar=document.getElementById('bar'), pct=document.getElementById('pct');
+    const pages=document.getElementById('pages'), badge=document.getElementById('badge');
+    const meta=document.getElementById('meta'), dl=document.getElementById('dl');
+    const actions=document.getElementById('actions'), retryWrap=document.getElementById('retry-wrap');
+    const missingBox=document.getElementById('missing-box'), cancelw=document.getElementById('cancel-wrap');
+    const errcard=document.getElementById('errcard'), errbox=document.getElementById('errbox');
+    const prevlist=document.getElementById('prevlist');
+    const logbox=document.getElementById('logbox');
+
+    function esc(s){return (s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+    async function poll(){
+      try{
+        const r=await fetch('/api/status/'+JOB);
+        const d=await r.json();
+        if(d.error && !d.ready){return;}
+
+        // progres
+        pct.textContent=d.percent?.toFixed(0) ?? 0;
+        pages.textContent=`${d.done_pages ?? d.last_page} / ${d.total_pages} halaman`;
+        bar.style.width=(d.percent??0)+'%';
+        bar.className='pfill'+(d.status==='done'?' done':d.status==='error'?' err':'');
+        badge.textContent=d.status;
+        badge.className='status s-'+d.status;
+
+        const mb=d.files?(d.files/1048576).toFixed(1):null;
+        meta.textContent=d.filename+(mb?` · ${mb} MB EPUB`:'');
+
+        // ready → tunjukkan tombol unduh
+        if(d.ready && d.epub_url){
+          actions.classList.remove('hidden');
+          dl.href=d.epub_url;
+          cancelw.classList.add('hidden');
+          retryWrap.classList.add('hidden');
+        } else {
+          cancelw.classList.remove('hidden');
+          if(d.status === 'error' && d.missing_pages && d.missing_pages.length){
+            retryWrap.classList.remove('hidden');
+            missingBox.classList.remove('hidden');
+            missingBox.textContent=d.missing_pages.map(x=>`Hal ${x}`).join(', ') + ' belum selesai';
+          } else {
+            retryWrap.classList.add('hidden');
+            missingBox.classList.add('hidden');
+          }
+        }
+
+        // error log
+        if(d.error){
+          errcard.classList.remove('hidden');
+          errbox.textContent=d.error;
+        } else {
+          errcard.classList.add('hidden');
+        }
+
+        // preview
+        if(d.previews && d.previews.length){
+          prevlist.innerHTML=d.previews.map(p=>
+            `<div class="preview"><div class="ph">Halaman ${p.page}</div><div class="pt">${esc(p.text)}</div></div>`
+          ).join('');
+        }
+
+        // log
+        if(d.log && d.log.length){
+          logbox.innerHTML=d.log.map(l=>{
+            const e=/error traceback|exception|failed/gi.test(l);
+            return `<div${e?' class="err-line"':''}>${esc(l)}</div>`;
+          }).join('');
+          logbox.scrollTop=logbox.scrollHeight;
+        }
+
+        if(d.status==='done'||d.status==='cancelled'){
+          clearInterval(timer);
+        }
+      }catch(e){}
+    }
+
+    async function cancelJob(){
+      if(!confirm('Hentikan terjemahan?'))return;
+      await fetch('/cancel/'+JOB,{method:'POST'});
+      alert('Dihentikan.');
+    }
+
+    async function retryJob(){
+      if(!confirm('Coba lagi untuk selesaikan halaman yang gagal?'))return;
+      try{
+        const r=await fetch('/retry/'+JOB,{method:'POST'});
+        const d=await r.json();
+        if(d.ok){
+          alert('Retry dimulai. Lihat log untuk progres.');
+          document.getElementById('retry-wrap').classList.add('hidden');
+          retryWrap.classList.remove('hidden');
+        } else {
+          alert('Gagal retry: '+(d.msg||'unknown'));
+        }
+      }catch(e){alert('Error jaringan');}
+    }
+
+    let timer=setInterval(poll,3000);
+    poll();
+  </script>
+</body>
+</html>
