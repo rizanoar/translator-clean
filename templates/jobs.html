@@ -3,81 +3,50 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta name="theme-color" content="#1e3a5f">
+  <meta name="theme-color" content="#0b1220">
+  <meta name="csrf-token" content="{{ CSRF }}">
   <title>Bebaa Book Translator – Pekerjaan</title>
-  <style>
-    :root {
-      --bg:#0f172a; --card:#1e293b; --border:#334155;
-      --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80;
-      --err:#f87171; --amber:#fbbf24;
-    }
-    *{box-sizing:border-box;}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:1rem;padding-bottom:4.5rem;}
-    .wrap{max-width:640px;margin:0 auto;}
-    h1{font-size:1.1rem;margin:.5rem 0 1rem;}
-    .job{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:.85rem;margin-bottom:.6rem;}
-    .job .name{font-weight:600;word-break:break-all;font-size:.9rem;}
-    .job .sub{color:var(--muted);font-size:.8rem;margin-top:.25rem;}
-    .job .meta{color:var(--muted);font-size:.75rem;margin-top:.3rem;}
-    .pbar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:.5rem;}
-    .pfill{height:100%;border-radius:3px;}
-    .status{padding:.35rem .6rem;border-radius:5px;font-size:.75rem;font-weight:600;display:inline-block;float:right;text-transform:uppercase;}
-    .s-running{background:rgba(56,189,248,.2);color:var(--accent);}
-    .s-done{background:rgba(74,222,128,.2);color:var(--green);}
-    .s-error{background:rgba(248,113,113,.2);color:var(--err);}
-    .s-cancelled{background:rgba(251,191,36,.2);color:var(--amber);}
-    .btn{display:block;padding:.55rem .75rem;border-radius:8px;text-align:center;text-decoration:none;font-weight:600;margin-top:.5rem;-webkit-tap-highlight-color:transparent;border:0;width:100%;font-size:.9rem;cursor:pointer;font-family:inherit;}
-    .btn-dl{background:var(--green);color:#06201f;}
-    .btn-preview{color:var(--accent);background:var(--border);border-left:3px solid var(--accent);}
-    .btn-retry{background:var(--amber);color:#1a1a1a;}
-    .btn-error{color:var(--err);background:var(--border);border-left:3px solid var(--err);}
-    .btn-cancel{background:rgba(251,191,36,.15);color:var(--amber);border:1px solid var(--amber);}
-    .btn-del{background:transparent;color:var(--err);border:1px solid var(--err);}
-    .empty{color:var(--muted);text-align:center;padding:2rem;}
-    .bottom{position:fixed;bottom:0;left:0;right:0;background:rgba(15,23,42,.92);backdrop-filter:blur(8px);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:.5rem 0 calc(.5rem + env(safe-area-inset-bottom));}
-    .bottom a{color:var(--muted);text-decoration:none;font-size:.7rem;padding:.4rem 1rem;text-align:center;}
-    .bottom a.active,.bottom a:hover{color:var(--accent);}
-    .bottom .ic{display:block;font-size:1.2rem;}
-    .toast{position:fixed;left:50%;bottom:5.5rem;transform:translateX(-50%);background:var(--card);border:1px solid var(--border);color:var(--text);padding:.6rem 1rem;border-radius:8px;font-size:.85rem;z-index:99;display:none;max-width:90vw;text-align:center;}
-  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
   <div class="wrap">
-    <h1>&#128218; Pekerjaan Terjemahan</h1>
-    <div id="list"><div class="empty">Memuat&hellip;</div></div>
+    <div class="topbar">
+      <h1 style="margin:0">📚 Pekerjaan Terjemahan</h1>
+      {% if AUTH_ON %}<a href="/logout">⎋ Keluar</a>{% endif %}
+    </div>
+    <div id="list"><div class="empty">Memuat…</div></div>
   </div>
   <div class="toast" id="toast"></div>
   <div class="bottom">
-    <a href="/"><span class="ic">&#128228;</span>Upload</a>
-    <a href="/jobs" class="active"><span class="ic">&#128193;</span>Pekerjaan</a>
+    <a href="/"><span class="ic">📤</span>Upload</a>
+    <a href="/jobs" class="active"><span class="ic">🗂️</span>Pekerjaan</a>
+    <a href="/settings"><span class="ic">⚙️</span>Settings</a>
   </div>
   <script>
-    var jobCache = {};
-
     function toast(msg){
-      var t=document.getElementById('toast');
+      const t=document.getElementById('toast');
       t.textContent=msg; t.style.display='block';
-      clearTimeout(window._tt); window._tt=setTimeout(function(){t.style.display='none';},3500);
+      clearTimeout(window._tt); window._tt=setTimeout(()=>t.style.display='none',3500);
     }
 
     async function cancelJob(id, name){
       if(!confirm('STOP job ini?\n\n'+name+'\n\nHalaman yang sudah selesai tetap disimpan dan bisa dilanjutkan lagi nanti.')) return;
       try{
-        var r=await fetch('/cancel/'+id,{method:'POST'});
-        var d=await r.json();
+        const r=await fetch('/cancel/'+id,{method:'POST',headers:PH});
+        const d=await r.json();
         if(d.ok){ toast('Job dihentikan'); setTimeout(load, 1500); }
         else { toast('Gagal: '+(d.msg||'tidak diketahui')); }
       }catch(e){ toast('Gagal menghentikan job'); }
     }
 
     async function delJob(id, name){
-      var msg='HAPUS PERMANEN job ini?\n\n'+name+'\n\nYang dihapus: PDF, semua halaman terjemahan, cache sqlite, gambar, EPUB, log.\n\nTindakan ini TIDAK BISA dibatalkan.';
+      const msg='HAPUS PERMANEN job ini?\n\n'+name+'\n\nYang dihapus: PDF, semua halaman terjemahan, cache sqlite, gambar, EPUB, log.\n\nTindakan ini TIDAK BISA dibatalkan.';
       if(!confirm(msg)) return;
       if(!confirm('Konfirmasi terakhir: benar-benar hapus permanen?')) return;
       try{
-        var r=await fetch('/delete/'+id,{method:'POST'});
-        var d=await r.json();
-        if(d.ok){ toast('Job dihapus ('+(d.freed_mb||0)+' MB dibebaskan) — cache bersih'); load(); }
+        const r=await fetch('/delete/'+id,{method:'POST',headers:PH});
+        const d=await r.json();
+        if(d.ok){ toast('Job dihapus ('+(d.freed_mb||0)+' MB dibebaskan)'); load(); }
         else { toast('Gagal: '+(d.msg||'tidak diketahui')); }
       }catch(e){ toast('Gagal menghapus'); }
     }
@@ -85,53 +54,53 @@
     async function retryJob(id){
       if(!confirm('Lanjutkan job ini dari halaman yang belum selesai?')) return;
       try{
-        var r=await fetch('/retry/'+id,{method:'POST'});
-        var d=await r.json();
+        const r=await fetch('/retry/'+id,{method:'POST',headers:PH});
+        const d=await r.json();
         if(d.ok){ toast('Job dilanjutkan'); setTimeout(load, 1500); }
         else { toast('Gagal: '+(d.msg||'tidak diketahui')); }
       }catch(e){ toast('Gagal melanjutkan'); }
     }
 
     function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-    function escAttr(s){return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');}
+    const CSRF=document.querySelector('meta[name="csrf-token"]').content;
+    const PH={'X-CSRF-Token':CSRF,'X-Requested-With':'fetch'};
 
     async function load(){
       try{
-        var r=await fetch('/api/jobs');
-        var data=await r.json();
-        var c=document.getElementById('list');
-        if(!data.length){c.innerHTML='<div class="empty">Belum ada pekerjaan.<br><a href="/">Upload buku &rarr;</a></div>';return;}
-        var html='';
-        data.forEach(function(j){
-          var pct=j.total_pages?(j.last_page/j.total_pages*100):0;
-          var col={done:'var(--green)',error:'var(--err)',cancelled:'var(--amber)',running:'var(--accent)'}[j.status]||'var(--accent)';
-          var active=(j.status==='running');
-          var missing=j.missing_pages||[];
-          var safeName=escAttr(j.filename);
+        const r=await fetch('/api/jobs');
+        const data=await r.json();
+        const c=document.getElementById('list');
+        if(!data.length){c.innerHTML='<div class="empty">Belum ada pekerjaan.<br><a href="/">Upload buku →</a></div>';return;}
+        let html='';
+        data.forEach(j=>{
+          const pct=j.total_pages?(j.last_page/j.total_pages*100):0;
+          const col={done:'var(--green)',error:'var(--err)',cancelled:'var(--amber)',running:'var(--accent)'}[j.status]||'var(--accent)';
+          const active=(j.status==='running');
+          const missing=j.missing_pages||[];
+          const safeName=esc(j.filename);
 
           html+='<div class="job">';
           html+='<span class="status s-'+j.status+'">'+esc(j.status)+'</span>';
           html+='<div class="name">'+esc(j.filename)+'</div>';
-          html+='<div class="sub">'+j.last_page+'/'+j.total_pages+' halaman &middot; '+esc(j.started_at||'')+'</div>';
-          html+='<div class="pbar"><div class="pfill" style="width:'+pct+'%;background:'+col+'"></div></div>';
-          html+='<div class="meta">&#128190; '+(j.size_mb||0)+' MB &middot; cache '+(j.cache_mb||0)+' MB</div>';
+          html+='<div class="sub">'+j.last_page+'/'+j.total_pages+' halaman · '+esc(j.started_at||'')+'</div>';
+          html+='<div class="pbar sm"><div class="pfill" style="width:'+pct+'%;background:'+col+'"></div></div>';
+          html+='<div class="meta">💾 '+(j.size_mb||0)+' MB · cache '+(j.cache_mb||0)+' MB</div>';
 
           if(j.ready){
-            html+='<a class="btn btn-dl" href="/download/'+j.id+'">&#128229; Unduh EPUB</a>';
+            html+='<a class="btn btn-green" style="margin-top:.6rem" href="/download/'+j.id+'">⬇️ Unduh EPUB</a>';
           }
+          html+='<a class="btn btn-outline" href="/progress/'+j.id+'">👁 Lihat Detail</a>';
           if(active){
-            html+='<a class="btn btn-preview" href="/progress/'+j.id+'">&#128064; Lihat Detail</a>';
-            html+='<button class="btn btn-cancel" onclick="cancelJob(\''+j.id+'\',\''+safeName+'\')">&#128721; Stop Job</button>';
+            html+='<button class="btn btn-err" onclick="cancelJob(\''+j.id+'\',\''+safeName+'\')">⏹ Stop Job</button>';
           } else {
-            html+='<a class="btn btn-preview" href="/progress/'+j.id+'">&#128064; Lihat Detail</a>';
-            var unfinished=(j.status!=='done');
+            const unfinished=(j.status!=='done');
             if(unfinished){
-              var sisa=Math.max(0,(j.total_pages||0)-(j.last_page||0));
-              var lbl=missing.length?('&#9654; Lanjutkan ('+missing.length+' halaman gagal)'):
-                      (sisa?('&#9654; Lanjutkan ('+sisa+' halaman sisa)'):'&#9654; Lanjutkan');
-              html+='<button class="btn btn-retry" onclick="retryJob(\''+j.id+'\')">'+lbl+'</button>';
+              const sisa=Math.max(0,(j.total_pages||0)-(j.last_page||0));
+              const lbl=missing.length?('▶ Lanjutkan ('+missing.length+' halaman gagal)'):
+                      (sisa?('▶ Lanjutkan ('+sisa+' halaman sisa)'):'▶ Lanjutkan');
+              html+='<button class="btn btn-amber" style="margin-top:.5rem" onclick="retryJob(\''+j.id+'\')">'+lbl+'</button>';
             }
-            html+='<button class="btn btn-del" onclick="delJob(\''+j.id+'\',\''+safeName+'\')">&#128465; Hapus Job (bersih total)</button>';
+            html+='<button class="btn btn-err" style="margin-top:.5rem" onclick="delJob(\''+j.id+'\',\''+safeName+'\')">🗑 Hapus Job (bersih total)</button>';
           }
           html+='</div>';
         });

@@ -1,0 +1,37 @@
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8091
+ * Running on http://192.168.100.5:8091
+[33mPress CTRL+C to quit[0m
+127.0.0.1 - - [01/Oct/2026 12:04:36] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:04:36] "GET /jobs HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:04:36] "GET /settings HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:04:36] "GET /api/jobs HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:04:36] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:05:30] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:05:50] "GET /settings HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:05:50] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:05:50] "GET /api/notify HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:05:50] "GET /api/providers HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:07:56] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:07:56] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:08:00] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:00] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:08:01] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:01] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:08:02] "GET /settings HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:02] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:08:02] "GET /api/notify HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:02] "GET /api/providers HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:11] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:11] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:08:18] "[32mPOST / HTTP/1.1[0m" 302 -
+127.0.0.1 - - [01/Oct/2026 12:08:18] "GET /progress/f6b3149389924f0b8e0fb9bdfed08364 HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:18] "[36mGET /static/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [01/Oct/2026 12:08:18] "GET /api/status/f6b3149389924f0b8e0fb9bdfed08364 HTTP/1.1" 200 -
+[notify] gagal kirim: belum ada Telegram/webhook yang dikonfigurasi
+127.0.0.1 - - [01/Oct/2026 12:08:21] "GET /api/status/f6b3149389924f0b8e0fb9bdfed08364 HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:30] "GET /download/f6b3149389924f0b8e0fb9bdfed08364 HTTP/1.1" 200 -
+127.0.0.1 - - [01/Oct/2026 12:08:34] "[36mGET /download/f6b3149389924f0b8e0fb9bdfed08364 HTTP/1.1[0m" 304 -

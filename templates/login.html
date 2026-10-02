@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1220">
+  <title>Bebaa Book Translator – Login</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="wrap" style="max-width:420px;margin-top:16vh">
+    <h1 style="text-align:center">🐻📚 Bebaa</h1>
+    <div class="card">
+      <h3>Masuk</h3>
+      {% if error %}<p class="err">⚠️ {{ error }}</p>{% endif %}
+      <form method="post" action="/login">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="hidden" name="next" value="{{ next_url or '/' }}">
+        <label for="pw">Password dashboard</label>
+        <input type="password" name="password" id="pw" autofocus required>
+        <button class="btn" type="submit">🔓 Masuk</button>
+      </form>
+      <p class="info" style="margin-top:.6rem">Password diatur lewat environment <code>FLASK_PASSWORD</code>.</p>
+    </div>
+  </div>
+</body>
+</html>

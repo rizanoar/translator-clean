@@ -3,88 +3,40 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta name="theme-color" content="#1e3a5f">
+  <meta name="theme-color" content="#0b1220">
+  <meta name="csrf-token" content="{{ CSRF }}">
   <title>Bebaa Book Translator – Progress</title>
-  <style>
-    :root {
-      --bg:#0f172a; --card:#1e293b; --border:#334155;
-      --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80;
-      --err:#f87171; --amber:#fbbf24;
-    }
-    *{box-sizing:border-box;}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:1rem;padding-bottom:4.5rem;}
-    .wrap{max-width:640px;margin:0 auto;}
-    a{color:var(--accent);text-decoration:none;}
-    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;}
-    .topbar h1{font-size:1.1rem;margin:0;}
-    .topbar a{font-size:.85rem;}
-    .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:.75rem;}
-
-    /* progress bar */
-    .pbar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;}
-    .pfill{height:100%;background:var(--accent);border-radius:4px;transition:width .5s;}
-    .pfill.done{background:var(--green);}
-    .pfill.err{background:var(--err);}
-    .pct{font-size:1.5rem;font-weight:800;letter-spacing:-1px;}
-    .pct .of{font-size:1rem;color:var(--muted);font-weight:400;}
-    .meta{color:var(--muted);font-size:.85rem;margin-top:.5rem;word-break:break-all;}
-    .status{padding:.15rem .5rem;border-radius:6px;font-size:.75rem;font-weight:600;display:inline-block;}
-    .s-running{background:rgba(56,189,248,.2);color:var(--accent);}
-    .s-done{background:rgba(74,222,128,.2);color:var(--green);}
-    .s-error{background:rgba(248,113,113,.2);color:var(--err);}
-    .s-cancelled{background:rgba(251,191,36,.2);color:var(--amber);}
-
-    .btn{display:inline-block;padding:.6rem 1.2rem;border-radius:10px;border:none;font-weight:700;font-size:.9rem;cursor:pointer;text-decoration:none;text-align:center;-webkit-tap-highlight-color:transparent;}
-    .btn-dl{background:var(--green);color:#06201f;width:100%;margin-top:.5rem;}
-    .btn-cancel{background:var(--err);color:#fff;}
-    .btn-retry{background:var(--amber);color:#1a1a1a;width:100%;}
-    .btn:active{transform:scale(.98);}
-
-    /* preview */
-    .preview{margin-bottom:.75rem;border-left:3px solid var(--accent);padding-left:.7rem;}
-    .preview .ph{font-size:.75rem;color:var(--muted);margin-bottom:.25rem;}
-    .preview .pt{font-size:.9rem;line-height:1.45;max-height:130px;overflow:hidden;}
-
-    /* log */
-    .log{font-family:monospace;font-size:.75rem;color:var(--muted);max-height:180px;overflow-y:auto;background:var(--bg);border-radius:6px;padding:.6rem;line-height:1.5;}
-    .log .err-line{color:var(--err);}
-    .toggle{cursor:pointer;color:var(--muted);font-size:.8rem;user-select:none;}
-    .toggle:hover{color:var(--accent);}
-    .hidden{display:none;}
-    .errbox{background:rgba(248,113,113,.08);border:1px solid var(--err);border-radius:8px;padding:.7rem;font-size:.85rem;color:var(--err);white-space:pre-wrap;word-break:break-word;}
-
-    .bottom{position:fixed;bottom:0;left:0;right:0;background:rgba(15,23,42,.92);backdrop-filter:blur(8px);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:.5rem 0 calc(.5rem + env(safe-area-inset-bottom));}
-    .bottom a{color:var(--muted);text-decoration:none;font-size:.7rem;padding:.4rem 1rem;text-align:center;}
-    .bottom a.active,.bottom a:hover{color:var(--accent);}
-    .bottom .ic{display:block;font-size:1.2rem;}
-  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
   <div class="wrap">
     <div class="topbar">
       <h1>📖 Terjemahan</h1>
-      <a href="/">← Upload baru</a>
+      <span>
+        <a href="/">← Upload baru</a>
+        {% if AUTH_ON %} · <a href="/logout">⎋ Keluar</a>{% endif %}
+      </span>
     </div>
 
     <div class="card" id="main">
       <div style="display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap">
-        <span class="pct"><span id="pct">0</span>%</span>
-        <span class="of" id="pages">0 / 0 halaman</span>
-        <span class="status s-running" id="badge">running</span>
+        <span class="pct"><span id="pct">0</span><span class="of">%</span></span>
+        <span class="meta" id="pages" style="margin:0">0 / 0 halaman</span>
+        <span class="status s-running" id="badge" style="margin-left:auto">running</span>
       </div>
       <div style="margin:.6rem 0">
         <div class="pbar"><div class="pfill" id="bar" style="width:0%"></div></div>
       </div>
       <div class="meta" id="meta">…</div>
       <div id="actions" class="hidden" style="margin-top:.75rem">
-        <a class="btn btn-dl" id="dl" href="#">⬇️ Unduh EPUB</a>
+        <a class="btn btn-green" id="dl" href="#">⬇️ Unduh EPUB</a>
       </div>
       <div id="retry-wrap" class="hidden" style="margin-top:.75rem">
-        <button class="btn btn-retry" onclick="retryJob()">🔄 Coba lagi halaman gagal</button>
+        <button class="btn btn-amber" style="margin-top:0" onclick="retryJob()">🔄 Coba lagi halaman gagal</button>
       </div>
       <div id="missing-box" class="hidden" style="margin-top:.6rem;color:var(--err);font-size:.8rem"></div>
       <div id="cancel-wrap" class="hidden" style="margin-top:.75rem">
-        <button class="btn btn-cancel" onclick="cancelJob()">⏹ Hentikan</button>
+        <button class="btn btn-err" style="margin-top:0" onclick="cancelJob()">⏹ Hentikan</button>
       </div>
     </div>
 
@@ -113,6 +65,7 @@
   <div class="bottom">
     <a href="/"><span class="ic">📤</span>Upload</a>
     <a href="/jobs"><span class="ic">🗂️</span>Pekerjaan</a>
+    <a href="/settings"><span class="ic">⚙️</span>Settings</a>
   </div>
 
   <script>
@@ -127,6 +80,8 @@
     const logbox=document.getElementById('logbox');
 
     function esc(s){return (s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+    const CSRF=document.querySelector('meta[name="csrf-token"]').content;
+    const PH={'X-CSRF-Token':CSRF,'X-Requested-With':'fetch'};
 
     async function poll(){
       try{
@@ -134,7 +89,6 @@
         const d=await r.json();
         if(d.error && !d.ready){return;}
 
-        // progres
         pct.textContent=d.percent?.toFixed(0) ?? 0;
         pages.textContent=`${d.done_pages ?? d.last_page} / ${d.total_pages} halaman`;
         bar.style.width=(d.percent??0)+'%';
@@ -145,7 +99,6 @@
         const mb=d.files?(d.files/1048576).toFixed(1):null;
         meta.textContent=d.filename+(mb?` · ${mb} MB EPUB`:'');
 
-        // ready → tunjukkan tombol unduh
         if(d.ready && d.epub_url){
           actions.classList.remove('hidden');
           dl.href=d.epub_url;
@@ -163,7 +116,6 @@
           }
         }
 
-        // error log
         if(d.error){
           errcard.classList.remove('hidden');
           errbox.textContent=d.error;
@@ -171,14 +123,12 @@
           errcard.classList.add('hidden');
         }
 
-        // preview
         if(d.previews && d.previews.length){
           prevlist.innerHTML=d.previews.map(p=>
             `<div class="preview"><div class="ph">Halaman ${p.page}</div><div class="pt">${esc(p.text)}</div></div>`
           ).join('');
         }
 
-        // log
         if(d.log && d.log.length){
           logbox.innerHTML=d.log.map(l=>{
             const e=/error traceback|exception|failed/gi.test(l);
@@ -195,19 +145,18 @@
 
     async function cancelJob(){
       if(!confirm('Hentikan terjemahan?'))return;
-      await fetch('/cancel/'+JOB,{method:'POST'});
+      await fetch('/cancel/'+JOB,{method:'POST',headers:PH});
       alert('Dihentikan.');
     }
 
     async function retryJob(){
       if(!confirm('Coba lagi untuk selesaikan halaman yang gagal?'))return;
       try{
-        const r=await fetch('/retry/'+JOB,{method:'POST'});
+        const r=await fetch('/retry/'+JOB,{method:'POST',headers:PH});
         const d=await r.json();
         if(d.ok){
           alert('Retry dimulai. Lihat log untuk progres.');
           document.getElementById('retry-wrap').classList.add('hidden');
-          retryWrap.classList.remove('hidden');
         } else {
           alert('Gagal retry: '+(d.msg||'unknown'));
         }

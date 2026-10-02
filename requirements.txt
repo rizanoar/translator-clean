@@ -1,0 +1,6 @@
+# Dependensi yang benar-benar dipakai kode (audit 2026-10)
+flask
+pypdf                    # hitung halaman PDF (count_pages / pdf_page_count)
+opencv-python-headless   # preprocess_image (cv2) — headless untuk server
+numpy                    # dipakai opencv + smart-crop ilustrasi
+Pillow                   # resize/compress gambar vision & ilustrasi

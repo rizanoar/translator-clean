@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1220">
+  <meta name="csrf-token" content="{{ CSRF }}">
+  <title>Bebaa Book Translator – Settings API</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <h1>⚙️ Pengaturan API</h1>
+      <span>
+        <a href="/">← Upload</a>
+        {% if AUTH_ON %} · <a href="/logout">⎋ Keluar</a>{% endif %}
+      </span>
+    </div>
+
+    {% if not AUTH_ON %}
+    <div class="card" style="border-color:var(--amber)">
+      <p class="info" style="color:var(--amber);margin:0">🔓 Mode terbuka — siapa pun di jaringan bisa mengubah konfigurasi API ini. Jalankan dengan env <code>FLASK_PASSWORD=…</code> untuk mengamankan.</p>
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <h3>Penyedia LLM (fallback berurutan)</h3>
+      <p class="info" style="margin:.3rem 0 .8rem">
+        Untuk menerjemahkan, sistem menelusuri model dari provider paling atas ke bawah.
+        Model pertama yang merespons valid dipakai; kuota habis/gagal → pindah otomatis.
+        <b>Isi Base URL + API Key → daftar model diambil otomatis</b>, tinggal pilih.
+      </p>
+      <div id="plist"><div class="empty">Memuat…</div></div>
+      <button class="btn btn-ghost" style="margin-top:.5rem" onclick="addProvider()">➕ Tambah Provider</button>
+      <button class="btn" onclick="saveAll()">💾 Simpan Konfigurasi</button>
+      <div class="err hidden" id="saveErr"></div>
+    </div>
+
+    <div class="card">
+      <h3>🔔 Notifikasi (opsional)</h3>
+      <p class="info" style="margin:.3rem 0 .6rem">Dikirim saat terjemahan <b>selesai</b> atau <b>gagal</b>. Kosongkan = nonaktif.</p>
+      <label>Telegram bot token <span class="chip hidden" id="tg-set"></span></label>
+      <input type="password" id="tg-token" placeholder="isi untuk mengatur / mengganti (tidak ditampilkan ulang)">
+      <label style="margin-top:.5rem">Telegram chat ID</label>
+      <input type="text" id="tg-chat">
+      <label style="margin-top:.5rem">Webhook URL (alternatif — menerima POST JSON {text})</label>
+      <input type="text" id="wh-url" placeholder="https://...">
+      <div style="display:flex;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+        <button class="btn btn-sm btn-outline" onclick="saveNotify()">💾 Simpan Notifikasi</button>
+        <button class="btn btn-sm btn-outline" onclick="testNotify()">🔔 Kirim tes</button>
+        <span class="chip hidden" id="nt-st"></span>
+      </div>
+      <div class="field-help" id="nt-msg" style="margin-top:.4rem"></div>
+    </div>
+
+    <div class="card">
+      <h3>Penyimpanan & keamanan konfigurasi</h3>
+      <p class="info">
+        • Tersimpan di <code>config/providers.json</code> — ditulis <b>atomik</b> (tidak bisa
+        setengah-tertulis saat listrik/server mati) + <b>backup otomatis</b> versi sebelumnya di
+        <code>providers.json.bak</code>.<br>
+        • Kalau file terlanjur korup, sistem otomatis mencoba memulihkan dari <code>.bak</code>;
+        file korup <b>tidak pernah ditimpa diam-diam</b>.<br>
+        • Izin file <code>600</code> — hanya pemilik proses yang bisa membacanya.<br>
+        • API key tidak pernah ditampilkan ulang di UI (kolom kosong = pakai key tersimpan).<br>
+        • Di Docker, folder <code>config/</code> di-mount sebagai volume → konfigurasi aman saat
+        image di-rebuild.
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>Catatan</h3>
+      <p class="info">
+        • <b>openai</b> = endpoint OpenAI-compatible (<code>/v1/chat/completions</code>): router bawaan,
+        LiteLLM, OpenRouter, vLLM, Ollama, Groq, dll.<br>
+        • <b>gemini</b> = Google Gemini API (<code>generativelanguage.googleapis.com/v1beta</code>).<br>
+        • Provider bawaan tanpa key → otomatis pakai key dari <code>~/.hermes/.env</code>.<br>
+        • <b>Vision model</b> per provider dipakai khusus untuk request bergambar (Vision OCR). Kosongkan jika model utama sudah multimodal.<br>
+        • Untuk <b>gemini</b>, hanya model yang mendukung <code>generateContent</code> yang ditampilkan.
+      </p>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="bottom">
+    <a href="/"><span class="ic">📤</span>Upload</a>
+    <a href="/jobs"><span class="ic">🗂️</span>Pekerjaan</a>
+    <a href="/settings" class="active"><span class="ic">⚙️</span>Settings</a>
+  </div>
+
+  <script>
+    let providers = [];
+    const remoteModels = {};   // index → [model, ...] hasil fetch
+    const fetchTimers = {};    // debounce auto-fetch
+
+    function toast(msg){
+      const t=document.getElementById('toast');
+      t.textContent=msg; t.style.display='block';
+      clearTimeout(window._tt); window._tt=setTimeout(()=>t.style.display='none',3500);
+    }
+    function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+    const CSRF=document.querySelector('meta[name="csrf-token"]').content;
+    const H={'Content-Type':'application/json','X-CSRF-Token':CSRF,'X-Requested-With':'fetch'};
+
+    function keyLabel(p){
+      if(p.key_hint) return 'key tersimpan '+p.key_hint;
+      if(p.has_env_key) return 'pakai key dari env / hermes';
+      return '⚠️ belum ada key';
+    }
+
+    function render(){
+      const c=document.getElementById('plist');
+      if(!providers.length){c.innerHTML='<div class="empty">Tidak ada provider.</div>';return;}
+      c.innerHTML=providers.map((p,i)=>`
+        <div class="provider">
+          <div class="head">
+            <span class="nm">${esc(p.name)} <span class="chip ${p.enabled?'ok':'warn'}">${p.enabled?'aktif':'nonaktif'}</span>${(p.models||[]).length?'':' <span class="chip warn" id="wm-'+i+'">belum ada model</span>'}</span>
+            <span>
+              <button class="btn btn-sm btn-ghost" onclick="moveUp(${i})" title="Naikkan prioritas">↑</button>
+              <button class="btn btn-sm btn-ghost" onclick="delProvider(${i})" title="Hapus">🗑</button>
+            </span>
+          </div>
+          <div class="row" style="margin-top:0">
+            <div>
+              <label>Nama</label>
+              <input type="text" value="${esc(p.name)}" oninput="providers[${i}].name=this.value">
+            </div>
+            <div>
+              <label>Tipe</label>
+              <select onchange="providers[${i}].type=this.value;queueAutoFetch(${i})">
+                <option value="openai" ${p.type==='openai'?'selected':''}>OpenAI-compatible</option>
+                <option value="gemini" ${p.type==='gemini'?'selected':''}>Gemini-compatible</option>
+              </select>
+            </div>
+          </div>
+          <label style="margin-top:.5rem">Base URL</label>
+          <input type="text" value="${esc(p.base_url)}" placeholder="https://.../v1"
+                 oninput="providers[${i}].base_url=this.value;queueAutoFetch(${i})">
+          <label style="margin-top:.5rem">API Key <span class="chip ${p.has_config_key?'ok':(p.has_env_key?'':'warn')}">${p.has_config_key?'tersimpan':(p.has_env_key?'dari env':'belum ada')}</span></label>
+          <input type="password" placeholder="${keyLabel(p)} — isi untuk mengganti"
+                 oninput="providers[${i}].api_key=this.value;queueAutoFetch(${i})">
+          <label style="margin-top:.5rem">Model chain (satu per baris, urutan fallback)</label>
+          <textarea rows="3" id="ta-${i}"
+            oninput="providers[${i}].models=this.value.split('\\n').map(x=>x.trim()).filter(x=>x);syncWarn(${i})">${esc((p.models||[]).join('\n'))}</textarea>
+          <label style="margin-top:.5rem">Vision model (khusus request bergambar)</label>
+          <input type="text" value="${esc(p.vision_model||'')}" placeholder="mis. gemini/gemini-2.0-flash"
+                 oninput="providers[${i}].vision_model=this.value">
+          <div style="display:flex;gap:.5rem;margin-top:.6rem;flex-wrap:wrap">
+            <label style="display:flex;align-items:center;gap:.4rem;margin:0">
+              <input type="checkbox" ${p.enabled?'checked':''} onchange="providers[${i}].enabled=this.checked" style="width:auto">
+              <span style="font-size:.8rem">Aktif</span>
+            </label>
+            <button class="btn btn-sm btn-outline" onclick="fetchModels(${i})">🔄 Ambil daftar model</button>
+            <button class="btn btn-sm btn-outline" onclick="testProvider(${i})">🔌 Tes koneksi</button>
+            <span class="chip hidden" id="st-${i}"></span>
+          </div>
+          <div class="field-help" id="ml-${i}" style="margin-top:.4rem"></div>
+        </div>
+      `).join('');
+      providers.forEach((_,i)=>{ if(remoteModels[i]) updateChips(i); });
+    }
+
+    async function loadCfg(){
+      try{
+        const r=await fetch('/api/providers');
+        const d=await r.json();
+        providers=(d.providers||[]).map(p=>({
+          ...p,
+          // key tidak pernah dikirim balik server → kirim sentinel agar tidak hilang saat simpan
+          api_key: p.has_config_key ? '__KEEP__' : (p.api_key || '')
+        }));
+        render();
+      }catch(e){ document.getElementById('plist').innerHTML='<div class="empty">Gagal memuat config.</div>'; }
+    }
+
+    /* ---------- auto-fetch model (debounce saat URL/key diketik) ---------- */
+    function queueAutoFetch(i){
+      clearTimeout(fetchTimers[i]);
+      fetchTimers[i]=setTimeout(()=>{
+        const p=providers[i];
+        if(p && p.base_url && p.base_url.startsWith('http') &&
+           (p.api_key && p.api_key!=='__KEEP__' || p.has_env_key)){
+          fetchModels(i);
+        }
+      }, 900);
+    }
+
+    /* ---------- ambil daftar model dari provider ---------- */
+    async function fetchModels(i, silent){
+      const ml=document.getElementById('ml-'+i), st=document.getElementById('st-'+i);
+      if(!silent && st){ st.classList.remove('hidden'); st.textContent='…mengambil'; st.className='chip'; }
+      try{
+        const r=await fetch('/api/providers/models',{method:'POST',headers:H,body:JSON.stringify({provider:providers[i]})});
+        const d=await r.json();
+        if(d.ok && d.models.length){
+          if(st){ st.textContent=d.models.length+' model'; st.className='chip ok'; }
+          remoteModels[i]=d.models;
+          if(!(providers[i].models||[]).length){
+            // chain masih kosong → isi otomatis dengan semua model yang ditemukan
+            providers[i].models=[...d.models];
+            const ta=document.getElementById('ta-'+i);
+            if(ta) ta.value=d.models.join('\n');
+            toast('Model chain terisi otomatis ('+d.models.length+' model)');
+            syncWarn(i);
+          }
+          updateChips(i);
+        }else{
+          remoteModels[i]=null;
+          if(st){ st.textContent='gagal'; st.className='chip warn'; }
+          if(ml) ml.textContent=(d.msg||'tidak ada model')+' — periksa Base URL/key, atau isi manual.';
+        }
+      }catch(e){
+        if(st){ st.textContent='error'; st.className='chip warn'; }
+        if(ml) ml.textContent='error jaringan saat mengambil model';
+      }
+    }
+
+    /* ---------- picker chip: klik = masuk/keluar dari chain ---------- */
+    function updateChips(i){
+      const ml=document.getElementById('ml-'+i);
+      if(!ml) return;
+      const cur=new Set(providers[i].models||[]);
+      const list=remoteModels[i]||[];
+      if(!list.length){ ml.innerHTML=''; return; }
+      ml.innerHTML=
+        `<div style="margin-bottom:.3rem">Klik model untuk masuk/keluar dari chain
+          (<a href="#" onclick="useAll(${i});return false">pakai semua</a>):
+        </div>` +
+        list.map(m=>{
+          const on=cur.has(m);
+          return `<span class="chip ${on?'ok':''}" style="cursor:pointer" onclick="toggleModel(${i},'${esc(m).replace(/'/g,"\\'")}')">${on?'✓ ':''}${esc(m)}</span>`;
+        }).join('');
+    }
+    function toggleModel(i,m){
+      const cur=new Set(providers[i].models||[]);
+      cur.has(m)?cur.delete(m):cur.add(m);
+      // pertahankan urutan sesuai daftar remote
+      providers[i].models=(remoteModels[i]||[]).filter(x=>cur.has(x))
+        .concat([...cur].filter(x=>!(remoteModels[i]||[]).includes(x)));
+      const ta=document.getElementById('ta-'+i);
+      if(ta) ta.value=providers[i].models.join('\n');
+      updateChips(i); syncWarn(i);
+    }
+    function useAll(i){
+      providers[i].models=[...(remoteModels[i]||[])];
+      const ta=document.getElementById('ta-'+i);
+      if(ta) ta.value=providers[i].models.join('\n');
+      updateChips(i); syncWarn(i);
+    }
+    function syncWarn(i){
+      const w=document.getElementById('wm-'+i);
+      if(w) w.classList.toggle('hidden', !!(providers[i].models||[]).length);
+    }
+
+    /* ---------- simpan / ubah provider ---------- */
+    async function saveAll(){
+      const err=document.getElementById('saveErr');
+      err.classList.add('hidden');
+      const kosong=providers.filter(p=>p.enabled!==false && !(p.models||[]).length).map(p=>p.name);
+      if(kosong.length && !confirm('Provider "'+kosong.join('", "')+'" aktif tapi belum punya model — simpan tetap?')) return;
+      try{
+        const r=await fetch('/api/providers',{method:'POST',headers:H,body:JSON.stringify({providers})});
+        const d=await r.json();
+        if(d.ok){ toast('Tersimpan ✓ (backup otomatis .bak dibuat)'); loadCfg(); }
+        else { err.textContent='Gagal: '+(d.msg||'?'); err.classList.remove('hidden'); }
+      }catch(e){ err.textContent='Error jaringan'; err.classList.remove('hidden'); }
+    }
+
+    function addProvider(){
+      providers.push({name:'Provider Baru',type:'openai',base_url:'https://api.openai-compatible.example/v1',api_key:'',models:[],vision_model:'',enabled:true,has_config_key:false,has_env_key:false});
+      render();
+      toast('Isi Base URL + API Key → daftar model diambil otomatis');
+    }
+    function delProvider(i){
+      if(!confirm('Hapus provider "'+providers[i].name+'" dari config?'))return;
+      providers.splice(i,1); delete remoteModels[i]; render();
+    }
+    function moveUp(i){
+      if(i===0)return;
+      [providers[i-1],providers[i]]=[providers[i],providers[i-1]];
+      render();
+    }
+
+    async function testProvider(i){
+      const st=document.getElementById('st-'+i);
+      if(st){ st.classList.remove('hidden'); st.textContent='…tes'; st.className='chip'; }
+      try{
+        const r=await fetch('/api/providers/test',{method:'POST',headers:H,body:JSON.stringify({provider:providers[i]})});
+        const d=await r.json();
+        if(st){
+          st.textContent=d.ok?('OK · '+d.model_count+' model'):'gagal: '+(d.msg||'?').slice(0,40);
+          st.className='chip '+(d.ok?'ok':'warn');
+        }
+        if(d.ok) fetchModels(i, true);
+      }catch(e){ if(st){ st.textContent='error'; st.className='chip warn'; } }
+    }
+
+    loadCfg();
+    loadNotify();
+
+    /* ---------- notifikasi (Telegram / webhook) ---------- */
+    async function loadNotify(){
+      try{
+        const r=await fetch('/api/notify');
+        const d=await r.json();
+        document.getElementById('tg-chat').value=d.telegram_chat||'';
+        document.getElementById('wh-url').value=d.webhook_url||'';
+        const chip=document.getElementById('tg-set');
+        chip.classList.remove('hidden');
+        chip.textContent=d.telegram_token_set?('token '+(d.telegram_token_hint||'tersimpan')):'belum ada token';
+        chip.className='chip '+(d.telegram_token_set?'ok':'warn');
+      }catch(e){}
+    }
+    async function saveNotify(){
+      const st=document.getElementById('nt-st');
+      st.classList.remove('hidden'); st.textContent='…menyimpan'; st.className='chip';
+      try{
+        const r=await fetch('/api/notify',{method:'POST',headers:H,body:JSON.stringify({
+          telegram_token:document.getElementById('tg-token').value,
+          telegram_chat:document.getElementById('tg-chat').value,
+          webhook_url:document.getElementById('wh-url').value})});
+        const d=await r.json();
+        st.textContent=d.ok?'tersimpan ✓':'gagal'; st.className='chip '+(d.ok?'ok':'warn');
+        if(d.ok){ document.getElementById('tg-token').value=''; loadNotify(); }
+      }catch(e){ st.textContent='error'; st.className='chip warn'; }
+    }
+    async function testNotify(){
+      const st=document.getElementById('nt-st'), msg=document.getElementById('nt-msg');
+      st.classList.remove('hidden'); msg.classList.remove('hidden');
+      st.textContent='…mengirim'; st.className='chip'; msg.textContent='';
+      try{
+        const r=await fetch('/api/notify/test',{method:'POST',headers:H,body:'{}'});
+        const d=await r.json();
+        st.textContent=d.ok?'terkirim ✓':'gagal'; st.className='chip '+(d.ok?'ok':'warn');
+        msg.textContent=d.ok?'Cek Telegram/webhook Anda.':'Gagal: '+(d.msg||'?');
+      }catch(e){ st.textContent='error'; st.className='chip warn'; }
+    }
+  </script>
+</body>
+</html>

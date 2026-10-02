@@ -3,19 +3,23 @@
 
 Pipeline per halaman:
   1. Ambil teks: pdftotext (PDF ber-teks, CEPAT) → jika < 25 kata,
-     render PNG + tesseract OCR (PDF scan).
+     render PNG + OCR (vision LLM jika USE_VISION=1, fallback tesseract).
   2. Halaman < 25 kata = ilustrasi → sematkan PNG.
-  3. LLM translate (auto-detect bahasa → Indonesia), cache SQLite.
-  4. Tulis page_NNNN.html secara atomik (tmp + rename).
+  3. Deteksi tabel/daftar-isi → full-page image, skip terjemahan.
+  4. LLM translate (auto-detect bahasa → Indonesia; sumber Indonesia
+     langsung lolos tanpa LLM), cache SQLite, anti-truncation.
+  5. Baris OCR digabung menjadi paragraf alami (dehyphenation).
+  6. Tulis page_NNNN.html secara atomik (tmp + rename).
 
 Paralel: ThreadPoolExecutor (env WORKERS, default 4).
-Fail-safe: multi-sweep — halaman gagal diulang di sweep berikutnya
-(dengan cooldown). Tidak ada halaman yang diam-diam tertinggal:
-halaman yang tetap gagal dicatat di pages.json + state.json
-(missing_pages), dan job berstatus error agar bisa di-retry dari UI.
+Fail-safe: multi-sweep — halaman gagal diulang di sweep berikutnya.
 Resume: page_NNNN.html yang sudah ada dianggap selesai (idempotent).
+MAX_PAGE otomatis di-clamp ke jumlah halaman riil PDF → tidak ada lagi
+"phantom pages" (missing pages di luar isi buku).
 """
 import pathlib, subprocess, shutil, sys, time, json, traceback, os, re, hashlib, sqlite3, signal
+import urllib.request, urllib.error
+from html import escape as _esc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
@@ -39,12 +43,10 @@ meta_file = WORK_DIR / 'meta.json'
 if not meta_file.exists():
     raise FileNotFoundError(f"meta.json not found in WORK_DIR — not a valid job directory: {WORK_DIR}")
 meta = json.loads(meta_file.read_text())
-expected_title = meta.get('filename', '').replace('.pdf', '')
+expected_title = (meta.get('title') or meta.get('filename', '')).replace('.pdf', '')
 book_title = os.getenv('BOOK_TITLE', '')
 if book_title and expected_title and book_title.replace('/', '') != expected_title.replace('/', ''):
-    raise RuntimeError(
-        f"BOOK_TITLE mismatch! meta={expected_title!r}, env={book_title!r}"
-    )
+    raise RuntimeError(f"BOOK_TITLE mismatch! meta={expected_title!r}, env={book_title!r}")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR = WORK_DIR / "images"
 IMG_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,48 +63,79 @@ CACHE_DB = pathlib.Path(os.getenv('CACHE_DB', str(WORK_DIR / 'cache.sqlite')))  
 TEST_FAIL_PAGES = set(int(x) for x in os.getenv('TEST_FAIL_PAGES', '').split(',') if x.strip())
 # PRESERVE_IMAGES=1 → setiap halaman: PNG selalu di-embed + teks tetap diterjemahkan
 PRESERVE_IMAGES = os.getenv('PRESERVE_IMAGES', '0') == '1'
-# --- Vision OCR: pakai gemini/gemini-3.5-flash-lite untuk render+OCR halaman gambar
+# --- Vision OCR: pakai model vision (multimodal) untuk render+OCR halaman scan
 # Aktifkan dengan: USE_VISION=1  (fallback ke tesseract jika vision gagal)
 USE_VISION = os.getenv('USE_VISION', '0') == '1'
+# Lebar gambar yang dikirim ke vision (px). 1280 = keseimbangan akurasi/biaya.
+VISION_WIDTH = int(os.getenv('VISION_WIDTH', '1280'))
+
+# ---------------------------------------------------------------- pdf utils
+def pdf_page_count():
+    """Jumlah halaman riil PDF: pypdf → pdfinfo. 0 jika keduanya gagal."""
+    try:
+        import pypdf
+        with open(PDF, 'rb') as fh:
+            return len(pypdf.PdfReader(fh).pages)
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(['pdfinfo', str(PDF)],
+                             capture_output=True, text=True, timeout=60).stdout
+        for line in out.splitlines():
+            if line.startswith('Pages:'):
+                return int(line.split(':')[1].strip())
+    except Exception:
+        pass
+    return 0
 
 # ---------------------------------------------------------------- table/TOC detect
-# Halaman tabel / daftar isi → full-page image + terjemahan (tidak OCR-parse).
-# Pola: paragraf sangat pendek banyak + kata kunci tabel/TOC.
+# Halaman tabel / daftar isi → full-page image + terjemahan diskip.
+# Deteksi: kata kunci (word-boundary, bukan substring) + pola struktur
+# (paragraf pendek banyak + baris berangka) + TANPA paragraf naratif panjang.
 TABLE_KEYWORDS = [
-    # Indonesian / Dutch
-    'tabel', 'daftar isi', 'inhoudsopgave', 'register', 'statistik',
-    'curah hujan', 'regenval', 'stasiun', 'stationsnaam', 'observasi',
-    'periode', 'tijdvak', 'gemiddeld', 'aantal',
+    # Indonesian / Dutch kata kunci tabel & statistik
+    'tabel', 'tabel 1', 'statistik', 'curah hujan', 'regenval', 'stasiun',
+    'stationsnaam', 'observatie', 'waarneming', 'periode', 'tijdvak',
+    'gemiddeld', 'aantal', 'hoogte', 'nummer', 'bladzijde',
     # TOC/index markers
-    'indeks', 'alfabetis', 'lampiran',
-    # table markers
-    'mm', 'meter', 'hoogte', 'nummer', 'bladzij', 'hal.',
+    'daftar isi', 'inhoudsopgave', 'table of contents', 'indeks', 'lampiran',
 ]
+TOC_TITLE_RE = re.compile(r'\b(daftar isi|inhoudsopgave|table of contents|register van)\b')
 TABLE_MIN_SHORT_RATIO = 0.70   # >=70% paragraf <=8 kata = pola tabel
-TABLE_MIN_P = 5               # minimal paragraf untuk dianggap tabel (turun dari 12 untuk TOC ringan)
-TOC_MAX_WORDS = 600            # halaman TOC biasanya pendek total
+TABLE_MIN_P = 6                # minimal paragraf agar layak dinilai
+TABLE_MAX_PARA_WORDS = 30      # ada 1 paragraf >30 kata → naratif, bukan tabel
+TABLE_AVG_PARA_WORDS = 14      # rata-rata kata/paragraf harus pendek
 
 def looks_like_table_or_toc(text, html=None):
     """Deteksi pola tabel/daftar-isi dari teks halaman.
     text: teks mentah halaman; html: page_*.html bila ada.
-    Return True → sisipkan full-page image."""
+    Return True → sisipkan full-page image, terjemahan diskip.
+    Konservatif: lebih baik tabel lolos ke LLM daripada halaman naratif
+    salah diskip (yang hilang dari buku)."""
     src = html or text
-    # ambil isi paragraf dari html bila ada
-    paras = re.findall(r'<p>(.*?)</p>', src, flags=re.DOTALL)
+    paras = re.findall(r'<p[^>]*>(.*?)</p>', src, flags=re.DOTALL)
+    paras = [re.sub(r'<[^>]+>', '', p).strip() for p in paras]
     if not paras:
         paras = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    paras = [p for p in paras if p]
     if len(paras) < TABLE_MIN_P:
         return False
-    short = sum(1 for pa in paras if len(pa.split()) <= 8)
-    ratio = short / len(paras)
-    if ratio < TABLE_MIN_SHORT_RATIO:
+
+    word_counts = [len(p.split()) for p in paras]
+    short_ratio = sum(1 for w in word_counts if w <= 8) / len(paras)
+    if short_ratio < TABLE_MIN_SHORT_RATIO:
         return False
+    if max(word_counts) > TABLE_MAX_PARA_WORDS:      # ada kalimat panjang → naratif
+        return False
+    if sum(word_counts) / len(paras) > TABLE_AVG_PARA_WORDS:
+        return False
+
     low = src.lower()
-    kw = [k for k in TABLE_KEYWORDS if k in low]
-    # TOC: kata kunci TOC atau banyak angka halaman
-    is_toc = any(k in low for k in ('daftar isi', 'inhoudsopgave', 'register'))
-    number_rows = sum(1 for pa in paras if re.search(r'\d', pa))
-    return bool(kw) or is_toc or number_rows >= 8
+    kw_hits = sum(1 for k in TABLE_KEYWORDS
+                  if re.search(rf'\b{re.escape(k)}\b', low))
+    is_toc = bool(TOC_TITLE_RE.search(low))
+    number_rows = sum(1 for p in paras if re.search(r'\d', p))
+    return kw_hits >= 2 or is_toc or number_rows >= max(8, len(paras) // 2)
 
 _stop = False          # SIGTERM → selesaikan halaman aktif, lalu stop
 _DETECTED_LANG = None  # bahasa sumber, di-cache per-proses dari file per-job
@@ -119,17 +152,21 @@ def load_state():
 
 def save_state(page=None, status="running", **extra):
     with _state_lock:
-        st = load_state()
-        if page is not None:
-            st['last_page'] = max(st.get('last_page', 0), page)
-        st['status'] = status
-        st['done_pages'] = len(list(WORK_DIR.glob('page_*.html')))
-        st['total_pages'] = MAX_PAGE
-        st['updated_at'] = time.strftime("%Y-%m-%d %H:%M:%S")
-        st.update(extra)
-        tmp = STATE_FILE.with_suffix('.tmp')
-        tmp.write_text(json.dumps(st))
-        tmp.replace(STATE_FILE)
+        try:
+            st = load_state()
+            if page is not None:
+                st['last_page'] = max(st.get('last_page', 0), page)
+            st['status'] = status
+            st['done_pages'] = len(list(WORK_DIR.glob('page_*.html')))
+            st['total_pages'] = MAX_PAGE
+            st['updated_at'] = time.strftime("%Y-%m-%d %H:%M:%S")
+            st.update(extra)
+            tmp = STATE_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(st))
+            tmp.replace(STATE_FILE)
+        except OSError as e:
+            # state.json best-effort — sumber kebenaran tetap page_*.html
+            print(f"[warn] gagal menulis state.json: {e}", flush=True)
 
 def load_pages_status():
     if PAGES_FILE.exists():
@@ -140,9 +177,12 @@ def load_pages_status():
     return {}
 
 def save_pages_status(ps):
-    tmp = PAGES_FILE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(ps, indent=1))
-    tmp.replace(PAGES_FILE)
+    try:
+        tmp = PAGES_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(ps, indent=1))
+        tmp.replace(PAGES_FILE)
+    except OSError as e:
+        print(f"[warn] gagal menulis pages.json: {e}", flush=True)
 
 def classify_error(exc):
     """Klasifikasikan error → kategori manusia-bisa-baca."""
@@ -202,7 +242,6 @@ def update_epub():
          text-align: center; color: #1a1a1a; border-bottom: 1px solid #ccc;
          padding-bottom: 0.3em; }
     p { margin: 0 0 0.9em 0; text-indent: 0; }
-    p + p { text-indent: 0; }
     .illustration-wrapper { margin: 1.5em 0; text-align: center;
                             page-break-inside: avoid; }
     .illustration-wrapper figure { margin: 0; padding: 0; }
@@ -211,8 +250,6 @@ def update_epub():
         border-radius: 3px; padding: 4px; background: #fff; }
     .illustration-wrapper figcaption { font-size: 0.85em; font-style: italic;
         color: #555; margin-top: 0.5em; padding: 0 1em; line-height: 1.4; }
-    .illustration-wrapper figcaption strong { font-style: normal;
-        color: #333; font-weight: 600; }
     .page-image { margin: 1em 0; text-align: center;
                   page-break-inside: avoid; }
     .page-image img { max-width: 100%; height: auto; }
@@ -230,20 +267,35 @@ def update_epub():
     xhtml.extend(["</body>", "</html>"])
     book_file = WORK_DIR / "book.xhtml"
     book_file.write_text("\n".join(xhtml))
-    subprocess.run([
-        "pandoc", str(book_file), "-o", str(EPUB_PATH),
-        "--metadata", f"title={BOOK_TITLE}",
-        "--metadata", "lang=id",
-        f"--resource-path={WORK_DIR}",
-    ], check=True)
+    try:
+        subprocess.run([
+            "pandoc", str(book_file), "-o", str(EPUB_PATH),
+            "--metadata", f"title={BOOK_TITLE}",
+            "--metadata", "lang=id",
+            f"--resource-path={WORK_DIR}",
+        ], check=True)
+    except FileNotFoundError:
+        raise RuntimeError("pandoc tidak ditemukan — pasang pandoc untuk membangun EPUB")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"pandoc gagal (rc={e.returncode}) — EPUB tidak dibangun")
 
 # ---------------------------------------------------------- translate
 def detect_language(nl_text):
     """Deteksi bahasa sumber — heuristik kata kunci (tanpa asumsi, tanpa default 'Dutch').
-    Hasil dicache di file PER-JOB (bukan env global → tidak bocor antar job)."""
+    Hasil di-cache per-proses + file PER-JOB (tidak bocor antar job)."""
     global _DETECTED_LANG
     if _DETECTED_LANG:
         return _DETECTED_LANG
+    # lanjutkan deteksi job sebelumnya (retry tidak mendeteksi ulang)
+    lang_file = WORK_DIR / 'detected_lang.txt'
+    if lang_file.exists():
+        try:
+            prev = lang_file.read_text().strip()
+            if prev:
+                _DETECTED_LANG = prev
+                return prev
+        except Exception:
+            pass
     low = " " + nl_text[:2000].lower() + " "
 
     scores = {
@@ -262,7 +314,7 @@ def detect_language(nl_text):
     }
     best = max(scores, key=scores.get)
     if scores[best] == 0:
-        # Tidak ada kata kunci dikenal → tanya LLM, jangan asumsikan "Dutch"
+        # Tidak ada kata kunci dikenal → tanya LLM, jangan asumsikan
         try:
             resp = chat(
                 "What language is this text? Reply with the language name in "
@@ -273,7 +325,7 @@ def detect_language(nl_text):
 
     _DETECTED_LANG = best
     try:
-        (WORK_DIR / 'detected_lang.txt').write_text(best)
+        lang_file.write_text(best)
     except Exception:
         pass
     print(f"[lang] Bahasa sumber terdeteksi: {best} (skor: {scores})", flush=True)
@@ -281,11 +333,16 @@ def detect_language(nl_text):
 
 def translate_page_text(raw_text, page_num=None):
     """Terjemahkan satu teks halaman → Indonesia (cache + retry).
+    Sumber sudah Bahasa Indonesia → lolos langsung tanpa panggil LLM.
     page_num: nomor halaman (dipakai TEST_FAIL_PAGES)."""
     cached = cache_get(raw_text)
     if cached:
         return cached, True
     lang = detect_language(raw_text)
+    if lang.lower().startswith('indones'):
+        print(f"    Hal {page_num or '?'}: sumber sudah Bahasa Indonesia → tanpa terjemahan", flush=True)
+        cache_put(raw_text, raw_text)
+        return raw_text, False
     prompt = (
         f"Translate this {lang} book text to natural, fluent Indonesian "
         f"(Bahasa Indonesia). Keep names, dates, and numbers unchanged. "
@@ -293,7 +350,7 @@ def translate_page_text(raw_text, page_num=None):
     )
     if TEST_FAIL_PAGES and page_num in TEST_FAIL_PAGES:
         raise RuntimeError(f"TEST_FAIL_PAGES aktif (halaman {page_num} gagal disengaja)")
-    out = chat(prompt, retries=5)   # chat() sudah retry+backoff internal
+    out = chat(prompt, retries=5)   # chat() sudah retry+backoff+anti-truncation
     if not out or not out.strip():
         raise RuntimeError("terjemahan kosong dari model")
     cache_put(raw_text, out)
@@ -307,7 +364,12 @@ def preprocess_image(src_png):
     Output hanya dipakai sebagai input vision; crop/embed EPUB tetap
     pakai PNG asli. Return path PNG hasil preprocess (fallback: asli).
     """
-    import cv2, numpy as np, pathlib
+    try:
+        import cv2, numpy as np
+    except ImportError as e:
+        print(f"    [warn] preprocessing dilewati (butuh opencv-python & numpy): {e}",
+              flush=True)
+        return str(src_png)
     src = pathlib.Path(str(src_png))   # pastikan Path object (bukan str)
     img = cv2.imread(str(src), cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -340,27 +402,27 @@ def preprocess_image(src_png):
 
 # ---------------------------------------------------------------- vision OCR
 def vision_ocr_page(png_path, page_num, text_only=False):
-    """Vision OCR: transkrip teks + deteksi ilustrasi.
-    - text_only=True → prompt hanya minta teks (ilustrasi diurus caller/cache)
-    Return: (dutch_text, illustrations)
-      - dutch_text: transkrip teks asli (Belanda) dari vision
-      - illustrations: list of dict {label, description, y_start_pct, y_end_pct}
-        (kosong [] jika text_only=True)
-    Gagal → return (None, None) — caller yang menentukan fallback."""
-    import base64, json as _json, pathlib as _p
-
-    # Resize ke 600px wide untuk vision (cepat + hemat bandwidth)
+    """Vision OCR: transkrip teks + deteksi ilustrasi oleh model multimodal.
+    - text_only=True → prompt hanya minta teks (ilustrasi diurus cache caller)
+    Return: (text, illustrations) atau (None, None) jika gagal —
+      caller menentukan fallback (rescue/tesseract).
+      illustrations: list of dict {label, description, y_start_pct, y_end_pct}
+    """
+    import base64, json as _json
     from PIL import Image
-    png_path = _p.Path(str(png_path))   # pastikan Path object
+    png_path = pathlib.Path(str(png_path))
+    # Resize ke VISION_WIDTH px (default 1280 — akurat OCR, hemat bandwidth)
     im = Image.open(str(png_path)).convert('RGB')
     w, h = im.size
-    ratio = min(600 / w, 1.0)
+    ratio = min(VISION_WIDTH / w, 1.0)
     small_path = png_path.with_suffix('.vision.jpg')
-    im.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS).save(str(small_path), 'JPEG', quality=75)
-
-    # Encode base64
-    with open(str(small_path), 'rb') as f:
-        b64 = base64.b64encode(f.read()).decode()
+    im.resize((max(1, int(w * ratio)), max(1, int(h * ratio))),
+              Image.LANCZOS).save(str(small_path), 'JPEG', quality=80)
+    try:
+        with open(str(small_path), 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode()
+    finally:
+        small_path.unlink(missing_ok=True)   # file sementara → segera dihapus
 
     if text_only:
         prompt = (
@@ -387,23 +449,17 @@ def vision_ocr_page(png_path, page_num, text_only=False):
         )
 
     try:
-        # Kirim gambar sebagai content block multimodal — model BENAR-BENAR melihat gambar
         data_uri = f"data:image/jpeg;base64,{b64}"
         resp = chat(prompt, retries=3, image_data_uri=data_uri)
-        # Parse JSON dari response
-        # Cari JSON di response
-        import re
         json_match = re.search(r'\{[\s\S]*\}', resp or '')
         if json_match:
             data = _json.loads(json_match.group())
             text_val = data.get('text', '')
-            # Jika text_val adalah list (vision kadang return array) → gabung jadi string
-            if isinstance(text_val, list):
+            if isinstance(text_val, list):   # vision kadang return array
                 text_val = ' '.join(str(t) for t in text_val)
             illustrations = data.get('illustrations', [])
             if not isinstance(illustrations, list):
                 illustrations = []
-            # Validasi hasil vision — abaikan jika teks kosong/berisi kata "image"
             if text_val and len(text_val.split()) >= 5:
                 return str(text_val), illustrations
     except urllib.error.HTTPError as e:
@@ -414,26 +470,20 @@ def vision_ocr_page(png_path, page_num, text_only=False):
     except Exception as e:
         print(f"    [warn] vision OCR gagal hal {page_num}: {e} — fallback tesseract", flush=True)
 
-    # Fallback: tesseract OCR (vision gagal/quota/non-vision)
     return None, None
 
 def crop_illustration(src_png, y1_pct, y2_pct, page_num, fig_idx):
     """Crop region ilustrasi berdasarkan posisi persen Y (dari vision).
     Return: path ke JPEG crop, atau None jika gagal."""
     from PIL import Image
-    import cv2
-
     img = Image.open(str(src_png))
     w, h = img.size
     y1 = int(h * y1_pct / 100)
     y2 = int(h * y2_pct / 100)
-    # x: full width (vision beri posisi Y saja)
     M = 15
     y1 = max(0, y1 - M)
     y2 = min(h, y2 + M)
-
     crop = img.crop((0, y1, w, y2))
-    # Optimize: max 1200px wide
     if w > 1200:
         ratio = 1200 / w
         crop = crop.resize((1200, int((y2 - y1) * ratio)), Image.LANCZOS)
@@ -442,10 +492,40 @@ def crop_illustration(src_png, y1_pct, y2_pct, page_num, fig_idx):
     return out_path
 
 # ------------------------------------------------------- satu halaman
+def _render_page_png(p):
+    """Render halaman p ke PNG 300dpi → return path file.
+    Gagal → RuntimeError dengan pesan yang bisa ditindaklanjuti."""
+    try:
+        subprocess.run([
+            "pdftoppm", "-f", str(p), "-l", str(p), "-r", "300", "-png",
+            str(PDF), str(WORK_DIR / f"p_{p}")
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"render halaman {p} gagal (pdftoppm rc={e.returncode}) — "
+            f"PDF mungkin rusak atau halaman di luar rentang")
+    except FileNotFoundError:
+        raise RuntimeError("pdftoppm tidak ditemukan — pasang paket poppler-utils")
+    files = list(WORK_DIR.glob(f"p_{p}-*.png"))
+    if not files:
+        raise RuntimeError(f"render halaman {p}: tidak ada file PNG output")
+    return files[0]
+
+def _cleanup_page_temp(p):
+    """Hapus semua file sementara halaman p (PNG render, vision jpg, preproc, ocr)."""
+    for f in WORK_DIR.glob(f"p_{p}-*"):        # p_XXXX-1.png + .vision.jpg + _preproc
+        f.unlink(missing_ok=True)
+    for f in WORK_DIR.glob(f"ocr_{p}.*"):
+        f.unlink(missing_ok=True)
+
 def extract_text(p):
     """Teks halaman p: pdftotext dulu (PDF ber-teks, CEPAT), fallback OCR (scan).
     Jika PRESERVE_IMAGES=1: SELALU render PNG + OCR (tanpa pakai pdftotext).
-    Jika USE_VISION=1: gunakan Vision OCR (render PNG → vision_analyze)."""
+    Jika USE_VISION=1: gunakan Vision OCR dengan escalation chain berbasis bukti:
+      a) Cache illustrations ada → vision text-only (preprocessed) [+illus dari cache]
+      b) Cache tidak ada → vision full (PNG asli, text+illus)
+      c) Vision text < 10 kata → rescue: preprocessed text-only
+      d) Tetap gagal → tesseract"""
     if not PRESERVE_IMAGES:
         # 1. coba pdftotext (cepat, tanpa gambar)
         try:
@@ -458,23 +538,14 @@ def extract_text(p):
         except Exception:
             pass
     # 2. render PNG (untuk OCR scan / PRESERVE_IMAGES / vision)
-    subprocess.run([
-        "pdftoppm", "-f", str(p), "-l", str(p), "-r", "300", "-png",
-        str(PDF), str(WORK_DIR / f"p_{p}")
-    ], check=True)
-    src_png = next(WORK_DIR.glob(f"p_{p}-*.png"))
+    src_png = _render_page_png(p)
 
-    # 3. Vision OCR (jika aktif) — lebih akurat untuk scan jadul
-    # ESCALATION CHAIN berbasis bukti:
-    #   a) Cache illustrations ada → vision text-only (preprocessed) [+illus dari cache]
-    #   b) Cache tidak ada → vision full (PNG asli, text+illus)
-    #   c) Vision text < 10 kata → rescue: preprocessed text-only
-    #   d) Tetap gagal → tesseract
+    # 3. Vision OCR (jika aktif)
     if USE_VISION:
         il_cache = WORK_DIR / f"illustrations_{p}.json"
         has_ilus_cache = il_cache.exists()
 
-        # a) Cache ada → text-only pada preprocessed (hemat, akurat)
+        # a) Cache ilustrasi ada → text-only pada preprocessed (hemat, akurat)
         if has_ilus_cache:
             try:
                 preproc = preprocess_image(src_png)
@@ -494,8 +565,7 @@ def extract_text(p):
                 print(f"    Hal {p}: [vision] OCR {len(vision_text.split())} kata, "
                       f"{len(illustrations)} ilustrasi terdeteksi", flush=True)
                 if illustrations:
-                    il_path = WORK_DIR / f"illustrations_{p}.json"
-                    il_path.write_text(json.dumps(illustrations))
+                    il_cache.write_text(json.dumps(illustrations))
                 return vision_text, src_png
         except Exception as ve:
             print(f"    [warn] vision gagal hal {p}: {ve} — rescue preprocessed", flush=True)
@@ -512,11 +582,133 @@ def extract_text(p):
 
     # 4. Fallback: tesseract OCR (vision gagal atau tidak aktif)
     ocr_prefix = str(WORK_DIR / f"ocr_{p}")
-    subprocess.run([
-        "tesseract", str(src_png), ocr_prefix, "-l", "nld+eng+ind", "--psm", "3"
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    txt = pathlib.Path(f"{ocr_prefix}.txt").read_text(errors="replace").strip()
-    return txt, src_png
+    try:
+        subprocess.run([
+            "tesseract", str(src_png), ocr_prefix, "-l", "nld+eng+ind", "--psm", "3"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "tesseract tidak ditemukan — pasang tesseract-ocr "
+            "(+ bahasa nld/eng/ind) untuk buku scan")
+    txt_path = pathlib.Path(f"{ocr_prefix}.txt")
+    if not txt_path.exists():
+        raise RuntimeError(f"tesseract tidak menghasilkan output untuk halaman {p}")
+    return txt_path.read_text(errors="replace").strip(), src_png
+
+def merge_ocr_paragraphs(txt):
+    """Gabungkan baris OCR menjadi paragraf alami untuk EPUB.
+    - Baris kosong → batas paragraf
+    - Baris sebelumnya pendek (relatif thd lebar teks) + diakhiri titik → batas
+    - Dehyphenation: 'konti-' + 'nental' → 'kontinental' (selalu digabung)
+    Return string paragraf dipisah baris kosong."""
+    raw = [l.strip() for l in txt.splitlines()]
+    max_line = max((len(l) for l in raw if l), default=0)
+    thresh = max(40, int(max_line * 0.7))   # "pendek" relatif thd lebar teks
+    paras, cur = [], []
+
+    def flush():
+        if cur:
+            paras.append(" ".join(cur))
+            cur.clear()
+
+    for s in raw:
+        if not s:
+            flush()
+            continue
+        if cur:
+            prev = cur[-1]
+            if prev.endswith('-'):
+                cur[-1] = prev[:-1] + s     # dehyphenate: selalu digabung
+                continue
+            if len(prev) < thresh and prev.endswith(('.', '!', '?', '…', '"')):
+                flush()                     # akhir kalimat di baris pendek → paragraf baru
+        cur.append(s)
+    flush()
+    return "\n\n".join(paras)
+
+def _append_illustrations(p, lines, ilus, src_png):
+    """Sisipkan ilustrasi hasil deteksi vision:
+    - >=2 ilustrasi → full-page image + terjemahan di bawah
+    - 1 ilustrasi → smart-crop dengan deteksi konten (numpy)."""
+    from PIL import Image as _PILImage
+    if len(ilus) >= 2:
+        dest = IMG_DIR / f"page_{p:04d}.jpg"
+        try:
+            src_full = src_png or _render_page_png(p)
+            _PILImage.open(str(src_full)).convert('RGB').save(
+                str(dest), 'JPEG', quality=85)   # PNG 300dpi besar → JPEG hemat
+            lines.append(
+                f"<div class='illustration-wrapper'><figure>"
+                f"<img src='images/page_{p:04d}.jpg' alt='Halaman {p}' "
+                f"style='max-width:100%;'>"
+                f"<figcaption>Ilustrasi asli halaman {p} (terjemahan di bawah)</figcaption>"
+                f"</figure></div>"
+            )
+            print(f"    Hal {p}: {len(ilus)} ilustrasi -> full-page image (JPEG)", flush=True)
+        except Exception as fe:
+            print(f"    [warn] gagal full-page hal {p}: {fe}", flush=True)
+        return
+
+    # --- 1 ilustrasi → smart crop ---
+    src_for_crop = src_png or _render_page_png(p)
+    img_full = _PILImage.open(str(src_for_crop)).convert('RGB')
+    w_img, h_img = img_full.size
+    import numpy as np
+    img_arr = np.array(img_full.convert('L'))
+    has_content_mask = img_arr < 200
+    rows_with_content = np.where(np.any(has_content_mask, axis=1))[0]
+    cols_with_content = np.where(np.any(has_content_mask, axis=0))[0]
+    if len(rows_with_content) < 10 or len(cols_with_content) < 10:
+        print(f"    [warn] hal {p} tidak ada konten visual cukup", flush=True)
+        return
+    for idx, ill in enumerate(ilus):
+        try:
+            ys_pct = max(0.0, min(100.0, float(ill.get('y_start_pct', 0))))
+            ye_pct = max(0.0, min(100.0, float(ill.get('y_end_pct', 100))))
+            if ye_pct - ys_pct < 5:
+                continue
+            y1_vision = int(h_img * ys_pct / 100)
+            y2_vision = int(h_img * ye_pct / 100)
+            margin = int((y2_vision - y1_vision) * 0.15)
+            y1 = max(0, y1_vision - margin)
+            y2 = min(h_img, y2_vision + margin)
+            region_mask = has_content_mask[y1:y2, :]
+            region_cols = np.where(np.any(region_mask, axis=0))[0]
+            if len(region_cols) < 5:
+                continue
+            # perluas ke bawah selama ada konten menempel (batasi 1.2x tinggi ilus)
+            y2_try = y2
+            while y2_try < h_img and has_content_mask[y2_try:y2_try + 20, :].any():
+                y2_try += 20
+            max_ext = int((y2_vision - y1_vision) * 1.2)
+            if y2_try > y2 and (y2_try - y2) < max_ext:
+                y2 = min(h_img, y2_try)
+            region_mask = has_content_mask[y1:y2, :]
+            region_cols = np.where(np.any(region_mask, axis=0))[0]
+            x1, x2 = (0, w_img) if len(region_cols) < 5 else \
+                (max(0, int(region_cols[0])), min(w_img, int(region_cols[-1]) + 1))
+            crop = img_full.crop((x1, y1, x2, y2))
+            max_dim = max(crop.width, crop.height)
+            if max_dim > 1200:
+                r = 1200 / max_dim
+                crop = crop.resize((int(crop.width * r), int(crop.height * r)),
+                                   _PILImage.LANCZOS)
+            crop_path = IMG_DIR / f"crop_{p:04d}_{idx + 1}.jpg"
+            crop.save(str(crop_path), 'JPEG', quality=85)
+            label = str(ill.get('label', f'Gambar {idx + 1}'))
+            desc = str(ill.get('description', ''))
+            try:
+                raw_caption = f"{label}. {desc}".strip()
+                id_caption, _ = translate_page_text(raw_caption, page_num=p)
+            except Exception:
+                id_caption = label
+            lines.append("<div class='illustration-wrapper'><figure>")
+            lines.append(f"<img src='images/crop_{p:04d}_{idx + 1}.jpg' alt='{_esc(label)}'>")
+            lines.append(f"<figcaption>{_esc(id_caption)}</figcaption>")
+            lines.append("</figure></div>")
+        except Exception as ie:
+            print(f"    [warn] crop gagal hal {p} ilus {idx + 1}: {ie}", flush=True)
+    print(f"    Hal {p}: {len(ilus)} ilustrasi cropped (smart)", flush=True)
 
 def process_page(p):
     """Proses satu halaman (dipanggil paralel oleh pool). Return (p, True/False)."""
@@ -527,17 +719,13 @@ def process_page(p):
         save_state(p)
         return p, True
     try:
-        print(f"[*] Hal {p}/{MAX_PAGE} ekstraksi teks... ({'text' if False else 'auto'})", flush=True)
+        print(f"[*] Hal {p}/{MAX_PAGE} ekstraksi teks...", flush=True)
         raw_text, src_png = extract_text(p)
         word_cnt = len(raw_text.split())
         if word_cnt < 25:
             # Ilustrasi: butuh PNG (mungkin belum dirender jika pdftotext jalan)
             if src_png is None:
-                subprocess.run([
-                    "pdftoppm", "-f", str(p), "-l", str(p), "-r", "300", "-png",
-                    str(PDF), str(WORK_DIR / f"p_{p}")
-                ], check=True)
-                src_png = next(WORK_DIR.glob(f"p_{p}-*.png"))
+                src_png = _render_page_png(p)
             dest = IMG_DIR / f"page_{p:04d}.png"
             shutil.copy(src_png, dest)
             html = (
@@ -547,144 +735,53 @@ def process_page(p):
             )
         else:
             lines = [f"<h2>Halaman {p}</h2>"]
-            # --- TABEL / DAFTAR ISI: HANYA full-page image, SKIP terjemahan ---
-            # Hasil translate tabel selalu acak/tidak terbaca → buang saja.
-            # Tampilkan gambar asli + caption, tanpa teks di bawah.
-            if looks_like_table_or_toc(raw_text, html=None):
+            # --- TABEL / DAFTAR ISI: full-page image, SKIP terjemahan ---
+            if looks_like_table_or_toc(raw_text):
                 try:
                     dest = IMG_DIR / f"page_{p:04d}.jpg"
-                    subprocess.run(["pdftoppm", "-f", str(p), "-l", str(p), "-r", "300", "-png",
-                        str(PDF), str(WORK_DIR / f"p_{p}")], check=True,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    src_full = next(WORK_DIR.glob(f"p_{p}-*.png"))
+                    src_full = src_png or _render_page_png(p)
                     from PIL import Image as _PIL2
                     img = _PIL2.open(str(src_full)).convert('RGB')
                     if max(img.size) > 1600:
                         r = 1600 / max(img.size)
-                        img = img.resize((int(img.width*r), int(img.height*r)), _PIL2.LANCZOS)
+                        img = img.resize((int(img.width * r), int(img.height * r)),
+                                         _PIL2.LANCZOS)
                     img.save(str(dest), 'JPEG', quality=85)
-                    src_full.unlink()
                     lines.append(
                         f"<div class='illustration-wrapper'><figure>"
                         f"<img src='images/page_{p:04d}.jpg' alt='Tabel hal {p}' "
                         f"style='max-width:100%;'>"
-                        f"<figcaption>Tabel/daftar asli halaman {p} — tampilan asli dipertahankan "
-                        f"(terjemahan diabaikan karena struktur tabel tidak dapat dipertahankan).</figcaption>"
+                        f"<figcaption>Tabel/daftar asli halaman {p} — tampilan asli "
+                        f"dipertahankan (terjemahan diabaikan karena struktur tabel "
+                        f"tidak dapat dipertahankan).</figcaption>"
                         f"</figure></div>"
                     )
-                    print(f"    Hal {p}: [tabel/TOC] full-page image, terjemahan diskip", flush=True)
-                    # SKIP: langsung tulis HTML tanpa id_txt
                     html = "\n".join(lines)
                     tmp = page_html.with_suffix('.tmp')
                     tmp.write_text(html)
                     tmp.replace(page_html)
+                    _cleanup_page_temp(p)
                     save_state(p)
                     print(f"[OK] Hal {p} selesai (tabel - image only).", flush=True)
                     return p, True
                 except Exception as te:
                     print(f"    [warn] gagal sisip tabel hal {p}: {te}", flush=True)
+
             print(f"    Hal {p}: terjemahan ({word_cnt} kata)...", flush=True)
             id_txt, from_cache = translate_page_text(raw_text, page_num=p)
             if from_cache:
                 print(f"    Hal {p}: [cache] terjemahan ditemukan di cache", flush=True)
-            # --- VISION: sisipkan ilustrasi cropped dari vision OCR ---
+
+            # --- VISION: sisipkan ilustrasi hasil deteksi ---
             ilus_path = WORK_DIR / f"illustrations_{p}.json"
             if ilus_path.exists():
-                import json as _json2
-                from html import escape as _esc
-                from PIL import Image as _PILImage
-                ilus = _json2.loads(ilus_path.read_text())
-                # --- SOLUSI TENGAH: >=2 ilustrasi → full-page image + terjemahan ---
-                if len(ilus) >= 2:
-                    dest = IMG_DIR / f"page_{p:04d}.jpg"
-                    try:
-                        subprocess.run(["pdftoppm", "-f", str(p), "-l", str(p), "-r", "300", "-png",
-                            str(PDF), str(WORK_DIR / f"p_{p}")], check=True)
-                        src_full = next(WORK_DIR.glob(f"p_{p}-*.png"))
-                        # Compress ke JPEG (PNG 300dpi 3.8MB → JPEG 85q 650KB)
-                        _PILImage.open(str(src_full)).convert('RGB').save(
-                            str(dest), 'JPEG', quality=85)
-                        lines.append(
-                            f"<div class='illustration-wrapper'><figure>"
-                            f"<img src='images/page_{p:04d}.jpg' alt='Halaman {p}' "
-                            f"style='max-width:100%;'>"
-                            f"<figcaption>Ilustrasi asli halaman {p} (terjemahan di bawah)</figcaption>"
-                            f"</figure></div>"
-                        )
-                        print(f"    Hal {p}: {len(ilus)} ilustrasi -> full-page image (JPEG)", flush=True)
-                        for f in WORK_DIR.glob(f"p_{p}-*.png"):
-                            f.unlink(missing_ok=True)
-                    except Exception as fe:
-                        print(f"    [warn] gagal full-page hal {p}: {fe}", flush=True)
-                else:
-                    # --- 1 ilustrasi → crop smart biasa ---
-                    src_for_crop = src_png
-                    if src_for_crop is None:
-                        subprocess.run(["pdftoppm", "-f", str(p), "-l", str(p), "-r", "300", "-png",
-                            str(PDF), str(WORK_DIR / f"p_{p}")], check=True)
-                        src_for_crop = next(WORK_DIR.glob(f"p_{p}-*.png"))
-                    img_full = _PILImage.open(str(src_for_crop)).convert('RGB')
-                    w_img, h_img = img_full.size
-                    import numpy as np
-                    img_arr = np.array(img_full.convert('L'))
-                    has_content_mask = img_arr < 200
-                    row_has_content = np.any(has_content_mask, axis=1)
-                    rows_with_content = np.where(row_has_content)[0]
-                    cols_with_content = np.where(np.any(has_content_mask, axis=0))[0]
-                    if len(rows_with_content) < 10 or len(cols_with_content) < 10:
-                        print(f"    [warn] hal {p} tidak ada konten visual cukup", flush=True)
-                    else:
-                        for idx, ill in enumerate(ilus):
-                            try:
-                                ys_pct = float(ill.get('y_start_pct', 0))
-                                ye_pct = float(ill.get('y_end_pct', 100))
-                                ys_pct = max(0.0, min(100.0, ys_pct))
-                                ye_pct = max(0.0, min(100.0, ye_pct))
-                                if ye_pct - ys_pct < 5:
-                                    continue
-                                y1_vision = int(h_img * ys_pct / 100)
-                                y2_vision = int(h_img * ye_pct / 100)
-                                margin = int((y2_vision - y1_vision) * 0.15)
-                                y1 = max(0, y1_vision - margin)
-                                y2 = min(h_img, y2_vision + margin)
-                                region_mask = has_content_mask[y1:y2, :]
-                                region_cols = np.where(np.any(region_mask, axis=0))[0]
-                                if len(region_cols) < 5:
-                                    continue
-                                y2_try = y2
-                                while y2_try < h_img and has_content_mask[y2_try:y2_try+20, :].any():
-                                    y2_try += 20
-                                max_ext = int((y2_vision - y1_vision) * 1.2)
-                                if y2_try > y2 and (y2_try - y2) < max_ext:
-                                    y2 = min(h_img, y2_try)
-                                region_mask = has_content_mask[y1:y2, :]
-                                region_cols = np.where(np.any(region_mask, axis=0))[0]
-                                if len(region_cols) < 5:
-                                    x1, x2 = 0, w_img
-                                else:
-                                    x1 = max(0, int(region_cols[0]))
-                                    x2 = min(w_img, int(region_cols[-1]) + 1)
-                                crop = img_full.crop((x1, y1, x2, y2))
-                                max_dim = max(crop.width, crop.height)
-                                if max_dim > 1200:
-                                    r = 1200 / max_dim
-                                    crop = crop.resize((int(crop.width * r), int(crop.height * r)), _PILImage.LANCZOS)
-                                crop_path = IMG_DIR / f"crop_{p:04d}_{idx+1}.jpg"
-                                crop.save(str(crop_path), 'JPEG', quality=85)
-                                label = str(ill.get('label', f'Gambar {idx+1}'))
-                                desc = str(ill.get('description', ''))
-                                try:
-                                    raw_caption = f"{label}. {desc}".strip()
-                                    id_caption, _ = translate_page_text(raw_caption, page_num=p)
-                                except Exception:
-                                    id_caption = label
-                                lines.append("<div class='illustration-wrapper'><figure>")
-                                lines.append(f"<img src='images/crop_{p:04d}_{idx+1}.jpg' alt='{_esc(label)}'>")
-                                lines.append(f"<figcaption>{_esc(id_caption)}</figcaption>")
-                                lines.append("</figure></div>")
-                            except Exception as ie:
-                                print(f"    [warn] crop gagal hal {p} ilus {idx+1}: {ie}", flush=True)
-                        print(f"    Hal {p}: {len(ilus)} ilustrasi cropped (smart)", flush=True)
+                try:
+                    ilus = json.loads(ilus_path.read_text())
+                    if isinstance(ilus, list) and ilus:
+                        _append_illustrations(p, lines, ilus, src_png)
+                except Exception as iee:
+                    print(f"    [warn] ilustrasi hal {p} gagal diproses: {iee}", flush=True)
+
             # PRESERVE_IMAGES: sisipkan gambar halaman utuh di atas teks
             if PRESERVE_IMAGES and src_png is not None:
                 dest = IMG_DIR / f"page_{p:04d}.png"
@@ -696,26 +793,23 @@ def process_page(p):
                     )
                 except Exception as ie:
                     print(f"    [warn] gagal copy gambar halaman {p}: {ie}", flush=True)
-            for ln in id_txt.splitlines():
-                if ln.strip():
-                    lines.append(f"<p>{ln.strip()}</p>")
+
+            # --- paragraf alami: gabungkan baris OCR/terjemahan ---
+            for para in merge_ocr_paragraphs(id_txt).split("\n\n"):
+                if para.strip():
+                    lines.append(f"<p>{_esc(para.strip())}</p>")
             html = "\n".join(lines)
         # tulis atomik: tmp → rename (tidak ada setengah-file)
         tmp = page_html.with_suffix('.tmp')
         tmp.write_text(html)
         tmp.replace(page_html)
-        # bersihkan file sementara
-        for f in WORK_DIR.glob(f"p_{p}-*.png"): f.unlink(missing_ok=True)
-        for f in WORK_DIR.glob(f"ocr_{p}.*"):   f.unlink(missing_ok=True)
+        _cleanup_page_temp(p)
         save_state(p)
         print(f"[OK] Hal {p} selesai.", flush=True)
         return p, True
     except Exception as e:
         log_error(p, e)
-        # bersihkan sisa file sementara agar sweep berikutnya bersih
-        for f in WORK_DIR.glob(f"p_{p}-*.png"): f.unlink(missing_ok=True)
-        for f in WORK_DIR.glob(f"p_{p}-*_preproc.png"): f.unlink(missing_ok=True)
-        for f in WORK_DIR.glob(f"ocr_{p}.*"):   f.unlink(missing_ok=True)
+        _cleanup_page_temp(p)   # bersihkan sisa sementara agar sweep berikutnya bersih
         return p, False
 
 # ---------------------------------------------------------------- main
@@ -735,12 +829,50 @@ def run_wave(pages):
             except Exception as e:
                 log_error(p, e)
             done += 1
-            # Progress tiap 50 halaman (human-readable)
             if done % 50 == 0 or done == total:
                 pct = int(done / total * 100)
                 print(f"  Progress gelombang: {done}/{total} ({pct}%) — {ok} ok, "
-                      f"{done-ok} error", flush=True)
+                      f"{done - ok} error", flush=True)
     return ok
+
+def _repair_state():
+    """Clamp MAX_PAGE ke jumlah halaman PDF riil + perbaiki state phantom.
+    Phantom pages = missing_pages/total_pages di luar isi PDF sebenarnya
+    (mis. MAX_PAGE env 480 padahal PDF 324 halaman) → job false-error."""
+    global MAX_PAGE
+    real = pdf_page_count()
+    if real:
+        if MAX_PAGE <= 0:
+            # count_pages gagal di app saat upload → jangan biarkan job selesai 0 halaman
+            print(f"[fix] MAX_PAGE {MAX_PAGE} tidak valid → set ke halaman riil PDF {real}",
+                  flush=True)
+            MAX_PAGE = real
+        elif MAX_PAGE > real:
+            print(f"[fix] MAX_PAGE {MAX_PAGE} > halaman riil PDF ({real}) → clamp ke {real}",
+                  flush=True)
+            MAX_PAGE = real
+    elif MAX_PAGE <= 0:
+        print("[warn] jumlah halaman PDF tidak bisa dibaca & MAX_PAGE 0 — "
+              "pakai 480; halaman di luar rentang akan gagal terlihat", flush=True)
+        MAX_PAGE = 480
+    st = load_state()
+    missing = [p for p in range(1, MAX_PAGE + 1)
+               if not (WORK_DIR / f"page_{p:04d}.html").exists()]
+    stale_missing = st.get('missing_pages') or []
+    if stale_missing != missing or st.get('total_pages') != MAX_PAGE:
+        if any(x > MAX_PAGE for x in stale_missing):
+            print(f"[fix] state phantom dibersihkan: "
+                  f"{len([x for x in stale_missing if x > MAX_PAGE])} halaman di luar PDF",
+                  flush=True)
+        st['missing_pages'] = missing
+        st['total_pages'] = MAX_PAGE
+        if not missing:
+            st['status'] = 'done'
+            print("[fix] Semua halaman riil sudah ada → status done", flush=True)
+        tmp = STATE_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(st))
+        tmp.replace(STATE_FILE)
+    return missing
 
 def main():
     # Tulis PID file — buat cancel bekerja setelah service restart
@@ -748,9 +880,10 @@ def main():
         (WORK_DIR / '.runner.pid').write_text(str(os.getpid()))
     except Exception as e:
         print(f"[warn] gagal tulis PID file: {e}", flush=True)
+
+    missing = _repair_state()
     ps = load_pages_status()   # per-page status: attempts, last_error
-    pending = [p for p in range(1, MAX_PAGE + 1)
-               if not (WORK_DIR / f"page_{p:04d}.html").exists()]
+    pending = missing
     print(f"Total {MAX_PAGE} halaman, pending {len(pending)}, "
           f"workers {WORKERS}, gelombang {BATCH}, sweep maks {SWEEPS}", flush=True)
     if not pending:
@@ -764,17 +897,20 @@ def main():
             print(f"=== Sweep {sweep}/{SWEEPS}: retry {len(pending)} halaman "
                   f"gagal (tunggu {wait}s dulu) ===", flush=True)
             for _ in range(wait):
-                if _stop: break
+                if _stop:
+                    break
                 time.sleep(1)
         remaining = list(pending)
         # proses dalam gelombang BATCH → EPUB diperbarui berkala
         for i in range(0, len(remaining), BATCH):
-            if _stop: break
+            if _stop:
+                break
             wave = remaining[i:i + BATCH]
             ok = run_wave(wave)
             try:
                 update_epub()
-                print(f"=== Gelombang selesai ({ok}/{len(wave)} sukses) → EPUB diperbarui ===", flush=True)
+                print(f"=== Gelombang selesai ({ok}/{len(wave)} sukses) → EPUB diperbarui ===",
+                      flush=True)
             except Exception as e:
                 log_error(0, e)
         # hitung ulang pending setelah sweep
@@ -803,6 +939,12 @@ def main():
         print(f"ERROR: {len(missing)} halaman gagal setelah {SWEEPS} sweep: {missing}", flush=True)
         print("Job ditandai error — gunakan tombol 'Coba lagi' di dashboard.", flush=True)
         sys.exit(1)
+    elif not EPUB_PATH.exists():
+        # semua halaman ada tetapi EPUB tidak terbangun → JANGAN bilang done
+        save_state(MAX_PAGE, status="error",
+                   error_msg="EPUB gagal dibangun — pastikan pandoc terpasang")
+        print("ERROR: halaman lengkap tetapi EPUB gagal dibangun (pandoc?).", flush=True)
+        sys.exit(1)
     else:
         save_state(MAX_PAGE, status="done", missing_pages=[])
         print(f"SELESAI 100%: semua {MAX_PAGE} halaman → {EPUB_PATH}", flush=True)
@@ -817,6 +959,20 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _sigterm)
     try:
         main()
+    except SystemExit:
+        raise                       # exit path yang disengaja (error/cancel) biarkan lewat
+    except BaseException:
+        # kegagalan tak terduga: catat ke error.log + state error, bukan mati diam-diam
+        import traceback as _tb
+        err = f"[FATAL] runner berhenti tak terduga: {sys.exc_info()[1]}\n{_tb.format_exc()}"
+        print(err, file=sys.stderr, flush=True)
+        try:
+            with open(ERROR_LOG, "a") as f:
+                f.write(err + "\n")
+            save_state(status="error")
+        except Exception:
+            pass
+        sys.exit(1)
     finally:
         # hapus PID file saat keluar (selesai / dihentikan)
         try:

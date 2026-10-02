@@ -1,8 +1,19 @@
-jobs/*/book.pdf
-jobs/*/terjemahan.epub
-jobs/*/cache.sqlite
-jobs/*/*.png
-jobs/*/*.html
-jobs/*/images/
-jobs/*/full_book_build/
-jobs/c3caffb838924dcfb3c472ef32dc3e50/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Artefak job & upload (berat: PDF, EPUB, SQLite, gambar)
+jobs/
+uploads/
+
+# Konfigurasi lokal berisi API key
+config/providers.json
+
+# Lain-lain
+epub_src/
+*.epub
+*.sqlite
+.DS_Store
+.secret_key

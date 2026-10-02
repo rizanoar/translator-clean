@@ -1,0 +1,23 @@
+{
+  "notify": {
+    "telegram_token": "",
+    "telegram_chat": "",
+    "webhook_url": ""
+  },
+  "providers": [
+    {
+      "name": "Router Bawaan (192.168.1.123:3005)",
+      "type": "openai",
+      "base_url": "http://192.168.1.123:3005/v1",
+      "api_key": "",
+      "models": [
+        "Atruzz/nex-agi/nex-n2.5-mini:free",
+        "cf/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+        "cf/@cf/qwen/qwen2.5-coder-32b-instruct",
+        "Atruzz/tencent/hy-mt2-30b-a3b"
+      ],
+      "vision_model": "Hermesbebaa",
+      "enabled": true
+    }
+  ]
+}

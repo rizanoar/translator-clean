@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  book-translator:
+    build: .
+    ports:
+      - "8091:8091"
+    volumes:
+      - .:/app
+    restart: unless-stopped

@@ -1,0 +1,34 @@
+# Bebaa Book Translator — unit systemd
+#
+# Pasang:
+#   1. Salin file ini: sudo cp deploy/bebaa-translator.service /etc/systemd/system/
+#   2. Sesuaikan User, WorkingDirectory, dan EnvironmentFile di bawah.
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now bebaa-translator
+#
+# Password dashboard WAJIB diisi di file env (lihat EnvironmentFile).
+
+[Unit]
+Description=Bebaa Book Translator (PDF -> EPUB Bahasa Indonesia)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ==== SESUAIKAN ====
+User=falcon
+WorkingDirectory=/home/falcon/bebaa
+ExecStart=/home/falcon/bebaa/.venv/bin/python app.py
+# File env opsional berisi FLASK_PASSWORD, FLASK_SECRET, WORKERS, dll:
+#EnvironmentFile=/home/falcon/bebaa/deploy/bebaa.env
+# ===================
+Restart=always
+RestartSec=5
+# Hardening ringan
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/falcon/bebaa
+
+[Install]
+WantedBy=multi-user.target
